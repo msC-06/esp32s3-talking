@@ -40,11 +40,20 @@ static bool               s_timeout_fired = false;  /*!< 本次按下是否已�
 
 /**
  * 接收 ASR / LLM 结果用的消息缓冲
- * @note  **必须放静态区**：app_text_msg_t 有 4KB+，本任务栈只有几 KB，
+ * @note  **必须放静态区**：app_text_msg_t 有 2KB，本任务栈只有几 KB，
  *        放局部变量会直接写穿自己的栈（现象：任务莫名跑飞）。
  *        只有本任务读这两个队列，所以静态复用是安全的。
  */
 static app_text_msg_t     s_rx_msg;
+
+/**
+ * “界面打字”兜底超时（lv_tick 无关，用 FreeRTOS tick 计）
+ * @note  正常流程是界面显示完最后一段后投递 APP_UI_EVENT_TYPING_DONE，
+ *        状态机收到才回到 IDLE。但万一那个事件丢了（队列满 / 界面任务异常），
+ *        状态机会永远卡在 AI_TYPING、按键再也按不动——
+ *        所以这里加一个兜底：超过 APP_CHAT_TYPING_TIMEOUT_MS 强制回 IDLE。
+ */
+static uint32_t           s_typing_deadline = 0;
 
 /* ============================ 按键扫描（20ms 周期回调） ============================ */
 
@@ -216,8 +225,9 @@ void app_key_task(void *arg)
     QueueHandle_t key_q = app_bus_key_queue();
     QueueHandle_t asr_q = app_bus_asr_queue();
     QueueHandle_t llm_q = app_bus_llm_queue();
+    QueueHandle_t ui_q  = app_bus_ui_queue();
 
-    if (key_q == NULL || asr_q == NULL || llm_q == NULL) {
+    if (key_q == NULL || asr_q == NULL || llm_q == NULL || ui_q == NULL) {
         ESP_LOGE(TAG, "队列未初始化，任务退出");
         vTaskDelete(NULL);
         return;
@@ -236,7 +246,9 @@ void app_key_task(void *arg)
             switch (key_ev) {
             case APP_KEY_EVENT_PRESS:
                 if (state != APP_STATE_IDLE) {
-                    ESP_LOGW(TAG, "正在处理上一轮对话，忽略这次按下");
+                    /* 上一轮还没收尾（含“界面正在逐字显示回复”），这次按下不生效 */
+                    ESP_LOGW(TAG, "当前状态不允许录音（%s），忽略这次按下",
+                             app_bus_state_text(state));
                     app_bus_post_chat(CHAT_MSG_STATUS, app_bus_state_text(state));
                     break;
                 }
@@ -277,16 +289,52 @@ void app_key_task(void *arg)
             }
         }
 
-        /* ---------------- 3. LLM 结果 ---------------- */
+        /* ---------------- 3. LLM 结果 ----------------
+         * 注意：AI 回复的正文**不是**在这里显示——网络任务每收到一段流式增量
+         * 就直接投递 CHAT_MSG_AI_DELTA 给界面（打字机逐字显示），
+         * 这里只负责收尾：如果界面还在打字，就先进 AI_TYPING 状态等它打完，
+         * 期间按键不响应（避免用户对着半句话追问，把流式通道搅乱）。 */
         if (xQueueReceive(llm_q, msg, 0) == pdTRUE) {
             if (!msg->ok) {
                 ESP_LOGW(TAG, "AI 回复失败：%s", msg->text);
                 app_bus_post_chat(CHAT_MSG_ERROR, msg->text);
+                s_typing_deadline = 0;
+                app_bus_set_state(APP_STATE_IDLE);
+            } else if (app_bus_is_ui_typing()) {
+                s_typing_deadline = xTaskGetTickCount() +
+                                    pdMS_TO_TICKS(APP_CHAT_TYPING_TIMEOUT_MS);
+                app_bus_set_state(APP_STATE_AI_TYPING);
             } else {
-                app_bus_post_chat(CHAT_MSG_AI, msg->text);
+                /* 界面已经追平（回复很短时很常见）：直接回待机 */
+                s_typing_deadline = 0;
+                app_bus_set_state(APP_STATE_IDLE);
             }
-            app_bus_set_state(APP_STATE_IDLE);
-            app_bus_post_chat(CHAT_MSG_STATUS, app_bus_state_text(APP_STATE_IDLE));
+            app_bus_post_chat(CHAT_MSG_STATUS, app_bus_state_text(app_bus_get_state()));
+        }
+
+        /* ---------------- 4. 界面回报事件 ---------------- */
+        app_ui_event_t ui_ev;
+        if (xQueueReceive(ui_q, &ui_ev, 0) == pdTRUE) {
+            if (ui_ev == APP_UI_EVENT_TYPING_DONE) {
+                s_typing_deadline = 0;
+                if (app_bus_get_state() == APP_STATE_AI_TYPING) {
+                    ESP_LOGI(TAG, "回复已显示完，回到待机");
+                    app_bus_set_state(APP_STATE_IDLE);
+                    app_bus_post_chat(CHAT_MSG_STATUS, app_bus_state_text(APP_STATE_IDLE));
+                }
+            }
+        }
+
+        /* ---------------- 5. 打字兜底超时 ---------------- */
+        if (s_typing_deadline != 0 &&
+            (int32_t)(xTaskGetTickCount() - s_typing_deadline) >= 0) {
+            s_typing_deadline = 0;
+            if (app_bus_get_state() == APP_STATE_AI_TYPING) {
+                ESP_LOGW(TAG, "等界面打字超过 %d 秒，强制回到待机",
+                         APP_CHAT_TYPING_TIMEOUT_MS / 1000);
+                app_bus_set_state(APP_STATE_IDLE);
+                app_bus_post_chat(CHAT_MSG_STATUS, app_bus_state_text(APP_STATE_IDLE));
+            }
         }
 
         /* 20ms 轮询一次，够快也不会白占 CPU */

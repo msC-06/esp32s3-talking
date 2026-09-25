@@ -14,6 +14,7 @@
 
 #include "app_web_search.h"
 #include "app_config.h"
+#include "app_gb2312.h"             /* app_utf8_char_bytes：拼接时按字符边界截断 */
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -78,15 +79,34 @@ static esp_err_t ws_http_event(esp_http_client_event_t *evt)
  * @param  limit    总长度上限（不含结尾 '\0'）
  * @param  src      要追加的字符串（可为 NULL，直接返回）
  * @return 追加后的已用字节数
+ *
+ * @note   截断位置**必须落在完整 UTF-8 字符的边界上**：
+ *         这段文本最终会塞进 role=tool 的消息里发给 DeepSeek，
+ *         浏览器/服务端对 JSON 里的非法 UTF-8 字节是零容忍的（直接 400 Invalid UTF-8）。
+ *         之前这里是一个字节一个字节地拷，中文标题正好被切在半路，就踩了这个坑。
  */
 static size_t ws_append(char *out_buf, size_t out_size, size_t used,
                         size_t limit, const char *src)
 {
-    if (src == NULL) {
+    if (src == NULL || out_buf == NULL) {
         return used;
     }
+    if (limit > out_size - 1) {
+        limit = out_size - 1;       /* 再兜一层，绝不允许写越界 */
+    }
+
     while (*src != '\0' && used < limit) {
-        out_buf[used++] = *src++;
+        int cb = app_utf8_char_bytes((unsigned char)*src);
+        if (cb <= 0) {
+            cb = 1;
+        }
+        if (used + (size_t)cb > limit) {
+            break;                  /* 放不下一整个字符了：宁可少几个字，不留半个汉字 */
+        }
+        for (int i = 0; i < cb; i++) {
+            out_buf[used++] = src[i];
+        }
+        src += cb;
     }
     out_buf[used] = '\0';
     return used;

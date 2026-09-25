@@ -112,32 +112,59 @@ void app_wifi_task(void *arg)
         return;
     }
 
-    /* 3. 连接 + 断线重连循环 */
-    for (;;) {
-        if (!net_is_connected()) {
-            wifi_post_status("WiFi: 连接中...");
-
-            err = net_connect(APP_WIFI_SSID, APP_WIFI_PASSWORD);
-            if (err == ESP_OK) {
-                wifi_refresh_ip();
-                char buf[64];
-                snprintf(buf, sizeof(buf), "WiFi: 已连接 %s", s_ip);
-                wifi_post_status(buf);
-            } else {
-                ESP_LOGW(TAG, "连接 %s 失败(%s)，%d 秒后重试",
-                         APP_WIFI_SSID, esp_err_to_name(err),
-                         APP_WIFI_RECONNECT_INTERVAL_MS / 1000);
-                wifi_post_status("WiFi: 连接失败 重试中");
-                vTaskDelay(pdMS_TO_TICKS(APP_WIFI_RECONNECT_INTERVAL_MS));
-            }
-            continue;
-        }
-
-        /* 已连接：定期刷新状态栏上的信号强度 */
+    /*
+     * 3. 只发起一次连接，之后把重连交给 bsp_wifi 自己的重连任务。
+     *
+     * 踩过的坑：这里原来是个“没连上就 net_connect() → 失败就等 5 秒再来”的循环，
+     *   而 bsp_wifi 内部也有一个自动重连任务（bsp_wifi_reconnect_task），
+     *   两边同时调 esp_wifi_connect() 就会互相打架，日志里出现
+     *   “wifi:sta is connected, disconnect before connecting to new ap”，
+     *   结果是把已经连上的链路又断开重来，永远连不稳。
+     *
+     * 现在：先连一次；连不上就等最多 APP_WIFI_RECONNECT_INTERVAL_MS 让底层重连任务去救；
+     *   还是没连上才再补一次手动连接（兜底），但两次之间至少隔一个 20 秒，
+     *   保证不会和底层重连任务形成高频拉锯。
+     */
+    wifi_post_status("WiFi: 连接中...");
+    err = net_connect(APP_WIFI_SSID, APP_WIFI_PASSWORD);
+    if (err == ESP_OK) {
         wifi_refresh_ip();
         char buf[64];
-        snprintf(buf, sizeof(buf), "WiFi: %s %d dBm", s_ip, net_get_rssi());
+        snprintf(buf, sizeof(buf), "WiFi: 已连接 %s", s_ip);
         wifi_post_status(buf);
+    } else {
+        ESP_LOGW(TAG, "首次连接 %s 失败(%s)，交给底层自动重连（最多等 %d 秒）",
+                 APP_WIFI_SSID, esp_err_to_name(err), APP_WIFI_RECONNECT_INTERVAL_MS / 1000);
+        wifi_post_status("WiFi: 连接失败 重试中");
+        if (!app_wifi_wait_connected(APP_WIFI_RECONNECT_INTERVAL_MS)) {
+            ESP_LOGW(TAG, "等底层重连超时，这里手动补连一次");
+            err = net_connect(APP_WIFI_SSID, APP_WIFI_PASSWORD);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "补连也失败(%s)，后续只依赖底层重连任务", esp_err_to_name(err));
+            }
+        }
+    }
+
+    /* 4. 主循环：只看状态、刷信号强度，**不再主动 connect**（避免和底层重连打架） */
+    uint32_t offline_ms = 0;
+    for (;;) {
+        if (net_is_connected()) {
+            offline_ms = 0;
+            wifi_refresh_ip();
+            char buf[64];
+            snprintf(buf, sizeof(buf), "WiFi: %s %d dBm", s_ip, net_get_rssi());
+            wifi_post_status(buf);
+        } else {
+            offline_ms += APP_WIFI_POLL_MS;
+            wifi_post_status("WiFi: 断开 重连中...");
+
+            /* 掉线很久（底层重连任务可能已经用尽次数）才手动补连一次，且限频 */
+            if (offline_ms >= APP_WIFI_RECONNECT_INTERVAL_MS) {
+                offline_ms = 0;
+                ESP_LOGW(TAG, "掉线超过 %d 秒，手动补连一次", APP_WIFI_RECONNECT_INTERVAL_MS / 1000);
+                net_connect(APP_WIFI_SSID, APP_WIFI_PASSWORD);
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(APP_WIFI_POLL_MS));
     }

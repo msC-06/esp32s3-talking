@@ -85,8 +85,10 @@
 #define BAIDU_ASR_CUID          "esp32s3-talking"
 /** 识别请求超时（毫秒） */
 #define BAIDU_ASR_TIMEOUT_MS    20000
-/** 取 token 超时（毫秒） */
-#define BAIDU_ASR_TOKEN_TIMEOUT_MS  10000
+/** 取 token 超时（毫秒）
+ *  @note 百度这个接口偶尔会很慢（实测有过握手成功但 10 秒不回数据），
+ *        所以给到 12 秒，失败还会换新连接重试一次（见 app_asr.c） */
+#define BAIDU_ASR_TOKEN_TIMEOUT_MS  12000
 /** Base64 分块大小（必须是 3 的倍数，避免分块产生 '=' 填充） */
 #define APP_ASR_B64_CHUNK       3072
 /** token 提前多久续期（秒）：剩余时间小于它就重新取 */
@@ -95,6 +97,10 @@
 #define APP_ASR_TOKEN_RESP_BUF_SIZE (6 * 1024)
 /** 读识别响应用的静态缓冲：要装得下 JSON 外壳 + APP_TEXT_MAX_LEN 的识别文本 */
 #define APP_ASR_RESP_BUF_SIZE       (8 * 1024)
+/** 上传失败且 WiFi 正好掉线时，最多等多久联网恢复（毫秒）再重试。
+ *  实测 AP 会以 reason=4（inactivity）把设备踢掉，自动重连一般 3~5 秒能回来，
+ *  等链路恢复再重试，比“没链路也硬试”成功率高得多 */
+#define APP_ASR_WAIT_LINK_MS        15000
 
 /* ============================================================
  *  3. DeepSeek：Chat Completions（LLM）
@@ -123,6 +129,12 @@
 /** 一次对话最多执行几个工具调用（防止模型一次丢一堆把内存吃满） */
 #define APP_LLM_MAX_TOOL_CALLS  2
 
+/** 历史对话正文合计上限（字节）：超出时只带最近几轮。
+ *  请求体是 cJSON 建在内部 RAM 里的，10 轮历史能到 20KB+，
+ *  再叠上 TLS 握手那 ~20KB 会把内部堆挤干（实测内部历史最低只剩 8KB，
+ *  之后连 TCP 连接都建不起来 → “Failed to open new connection”）。 */
+#define APP_LLM_HISTORY_BUDGET  4096
+
 /* ============================================================
  *  3.5 Tavily 联网搜索（DeepSeek Function Calling 的 web_search 工具）
  *      https://app.tavily.com/home  ->  API Keys
@@ -141,6 +153,34 @@
 #define APP_WEB_SEARCH_TEXT_MAX         (5 * 1024)
 /** 读 Tavily 响应用的 PSRAM 缓冲（3 条结果的原始 JSON 可能几十 KB，给足） */
 #define APP_WEB_SEARCH_RESP_BUF_SIZE    (64 * 1024)
+
+/* ============================================================
+ *  3.6 流式输出（SSE）与打字机显示
+ * ============================================================ */
+
+/** 1 = DeepSeek 用 SSE 流式返回（stream=true），边收边追加到气泡；
+ *  0 = 退回一次性返回（界面对整段文字做伪打字机动画） */
+#define APP_LLM_STREAM_ENABLE       1
+/** HTTP 响应里单行 SSE（data: {...}）的最大长度；超长整行丢弃并告警 */
+#define APP_HTTP_SSE_LINE_MAX       1024
+/** 流式 tool_calls 的 arguments 分片拼起来后的最大长度 */
+#define APP_LLM_TOOL_ARGS_MAX       768
+
+/** 1 = 打开打字机效果（逐字追加，而不是一次性 set_text 整段） */
+#define APP_CHAT_TYPE_ENABLE        1
+/** 两次追加之间的间隔（毫秒） */
+#define APP_CHAT_TYPE_INTERVAL_MS   100
+/** 每个间隔追加几个“字”：1 个汉字算 1 个字，ASCII 算 1/3 个字
+ *  （即 =1 时就是“每个间隔 1 个汉字 或 3 个英文字符”） */
+#define APP_CHAT_TYPE_UNITS         1
+/** 待显示文本超过这么多字节后开始加速追赶（0 = 关闭追赶，严格按上面速度打）
+ *  @note 流式返回比打字速度快，完全不追赶的话长回复要打很久 */
+#define APP_CHAT_TYPE_CATCHUP_BYTES 120
+/** 追赶时每次最多追加几个“字”（限速，别一下全糊上去） */
+#define APP_CHAT_TYPE_MAX_UNITS     8
+/** 进入“AI 正在输出”状态后的兜底超时（毫秒）：
+ *  万一界面没回报“打完”，也不至于一直锁着按键不让录音 */
+#define APP_CHAT_TYPING_TIMEOUT_MS  90000
 
 /* ============================================================
  *  4. 对话历史
@@ -212,6 +252,7 @@
 #define APP_ASR_QUEUE_LEN           2       /* ASR 结果 */
 #define APP_LLM_QUEUE_LEN           2       /* LLM 结果 */
 #define APP_CHAT_QUEUE_LEN          6       /* 聊天消息 -> 界面 */
+#define APP_UI_QUEUE_LEN            4       /* 界面事件 -> 业务状态机（打字完成等） */
 
 /** ASR 识别文本 / LLM 回复文本消息的缓冲长度（也是一轮回复的硬上限）
  *  @note 2048 字节能装约 1000 个汉字，对“简洁回答”的系统提示足够了 */
@@ -282,5 +323,52 @@
 #define APP_COLOR_ERROR             0xFF5252    /* 错误文字 */
 #define APP_COLOR_OK                0x66BB6A    /* 正常/已连接 */
 #define APP_COLOR_WARN              0xFFD54F    /* 提示文字 */
+
+/* ============================================================
+ *  10. 系统时间（SNTP 对时，app_time.c）
+ * ============================================================ */
+
+/**
+ * 总开关。
+ * ESP32-S3 没有带电池的 RTC，开机时间是 1970-01-01，
+ * 不问时间的话大模型会自己编一个日期（问“今天几号”它答 2025-06-13 这种）。
+ * 打开后：界面待机提示会显示 HH:MM，system 提示词里也会带上真实日期时间。
+ */
+#define APP_TIME_ENABLE             1
+
+/**
+ * 时区（POSIX TZ 字符串）。
+ *   CST-8        = 中国标准时间 UTC+8（注意符号是反的：CST-8 表示东八区）
+ *   UTC0         = 零时区
+ *   想看更多写法（带夏令时）搜 “POSIX TZ string”。
+ */
+#define APP_TIME_TZ                 "CST-8"
+
+/** NTP 服务器（按顺序尝试；国内优先，避免解析到国外慢节点）
+ *  @note 能用几个取决于 sdkconfig 的 CONFIG_LWIP_SNTP_MAX_SERVERS（本工程设为 3） */
+#define APP_TIME_SNTP_SERVER1       "ntp.aliyun.com"
+#define APP_TIME_SNTP_SERVER2       "cn.pool.ntp.org"
+#define APP_TIME_SNTP_SERVER3       "pool.ntp.org"
+
+/** 单次对时最长等待（毫秒） */
+#define APP_TIME_SYNC_TIMEOUT_MS    15000
+/** 对时失败后多久重试（毫秒） */
+#define APP_TIME_RETRY_MS           (30 * 1000)
+/** 对时成功后多久复查一次（毫秒，默认 6 小时；RTC 有漂移，定期校准） */
+#define APP_TIME_RESYNC_INTERVAL_MS (6 * 60 * 60 * 1000)
+
+/** 对时任务的优先级 / 栈 / 核（低优先级，纯等待，放网络核） */
+#define APP_TIME_TASK_PRIO          3
+#define APP_TIME_TASK_STACK         3072
+#define APP_TIME_TASK_CORE          0
+
+/**
+ * 是否把当前时间写进大模型的 system 提示词。
+ * 关掉的话模型就不知道真实日期了（问时间会瞎猜）。
+ */
+#define APP_TIME_INJECT_TO_LLM      1
+
+/** system 提示词缓冲大小（原文 + 时间那句话 + 结束符） */
+#define APP_LLM_SYSTEM_PROMPT_MAX   512
 
 #endif /* __APP_CONFIG_H */

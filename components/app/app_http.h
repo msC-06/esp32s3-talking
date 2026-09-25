@@ -34,7 +34,29 @@ typedef struct {
     size_t cap;         /*!< 缓冲容量（含结尾 '\0'） */
     size_t len;         /*!< 已累积的字节数（不含 '\0'） */
     bool   overflow;    /*!< true = 响应比缓冲长，已被截断 */
+    /* ---- 下面两个字段用于 SSE 流式模式（见 app_http_set_line_cb） ---- */
+    void (*line_cb)(const char *line, void *ctx);   /*!< 每收到完整一行就回调 */
+    void  *line_ctx;                                /*!< 回调上下文 */
 } app_http_resp_t;
+
+/**
+ * @brief  SSE 行回调：每收到一个完整行（\n 结尾）调用一次，\r\n 已去掉
+ *
+ * @param  line 行内容（'\0' 结尾，不含换行）
+ * @param  ctx  注册时传入的上下文
+ */
+typedef void (*app_http_line_cb_t)(const char *line, void *ctx);
+
+/**
+ * @brief  打开“流式逐行模式”：响应边收边按行回调（SSE 用），同时仍攒进 buf
+ *
+ * @param  resp 上下文
+ * @param  cb   行回调（传 NULL 恢复普通的整体累积模式）
+ * @param  ctx  回调上下文
+ *
+ * @note   单行超过 APP_HTTP_SSE_LINE_MAX 时整行丢弃并告警（不会把半行交出去）。
+ */
+void app_http_set_line_cb(app_http_resp_t *resp, app_http_line_cb_t cb, void *ctx);
 
 /**
  * @brief  初始化响应上下文

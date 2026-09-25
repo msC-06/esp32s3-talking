@@ -37,6 +37,17 @@ extern "C" {
 size_t utf8_to_gb2312(const char *utf8, char *gb, size_t gb_size);
 
 /**
+ * @brief  按首字节判断一个 UTF-8 字符占几个字节
+ *
+ * @param  first_byte 字符首字节
+ * @return 1~4；非法首字节返回 1（当单字节往前走，避免死循环）
+ *
+ * @note   打字机逐字追加、按字节安全截断时都要用它，
+ *         保证永远不会把多字节字符切成两半。
+ */
+int app_utf8_char_bytes(unsigned char first_byte);
+
+/**
  * @brief  估算一段 UTF-8 文本用 hzk16 渲染需要多少像素宽
  *
  * @param  utf8 UTF-8 文本（可为 NULL，返回 0）

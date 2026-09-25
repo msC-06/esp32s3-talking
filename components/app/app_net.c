@@ -1,6 +1,6 @@
 /**
  * @file    app_net.c
- * @brief   网络请求任务实现（ASR + LLM 串联）
+ * @brief   网络请求任务实现（ASR + LLM 流式串联）
  */
 
 #include <string.h>
@@ -35,6 +35,25 @@ static const char *TAG = "APP_NET";
 EXT_RAM_BSS_ATTR static char s_asr_text[APP_TEXT_MAX_LEN];
 EXT_RAM_BSS_ATTR static char s_llm_reply[APP_TEXT_MAX_LEN];
 
+/* ============================ 内部函数 ============================ */
+
+/**
+ * @brief  LLM 流式正文增量回调（在网络任务上下文里同步执行）
+ *
+ * @note   这里**只做一件事**：把这一小段正文投递给界面队列（打字机自己逐字显示）。
+ *         不在回调里碰 LVGL 控件——跨线程操作控件会随机崩，
+ *         而且阻塞在这里会拖慢 HTTP 收包。
+ */
+static void net_llm_delta_cb(const char *text, void *ctx)
+{
+    (void)ctx;
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
+    ESP_LOGD(TAG, "流式增量 %u 字节", (unsigned)strlen(text));
+    app_bus_post_chat(CHAT_MSG_AI_DELTA, text);
+}
+
 /* ============================ 对外接口 ============================ */
 
 esp_err_t app_net_init(void)
@@ -59,6 +78,15 @@ void app_net_task(void *arg)
 
     ESP_LOGI(TAG, "网络任务启动（Core %d，优先级 %d）", xPortGetCoreID(), uxTaskPriorityGet(NULL));
 
+    /* 0. 开机预热：等 WiFi 上来后先把百度 access_token 取回来。
+     *    百度 token 有效期 30 天，一次请求 1~2 秒，
+     *    放在这里就等于把这 1~2 秒从“用户第一次说话”的关键路径上挪走了。 */
+    if (app_wifi_wait_connected(NET_WAIT_WIFI_MS)) {
+        app_asr_prefetch_token();
+    } else {
+        ESP_LOGW(TAG, "开机等 WiFi 超时，等第一次识别时再取 token");
+    }
+
     for (;;) {
         app_pcm_msg_t msg;
 
@@ -68,7 +96,7 @@ void app_net_task(void *arg)
         }
         ESP_LOGI(TAG, "收到录音：%u 字节 / %u ms", (unsigned)msg.bytes, (unsigned)msg.duration_ms);
 
-        /* 2. 没联网先等一下（刚开机时用户可能马上说话） */
+        /* 2. 没联网先等一下（网络掉线后重连、或刚开机用户马上说话） */
         if (!app_wifi_is_connected()) {
             app_bus_post_chat(CHAT_MSG_STATUS, "等待 WiFi 连接...");
             if (!app_wifi_wait_connected(NET_WAIT_WIFI_MS)) {
@@ -95,14 +123,24 @@ void app_net_task(void *arg)
         app_bus_post_asr(true, s_asr_text);                     /* 给业务状态机（切状态用） */
         app_bus_post_chat(CHAT_MSG_USER, s_asr_text);           /* 立刻上屏：用户气泡 */
 
-        /* 5. 大模型对话（DeepSeek，自动带上下文） */
+        /* 5. 大模型对话（DeepSeek 流式：正文一段一段通过回调推给界面打字机）。
+         *    历史/工具调用等都在 app_llm 内部处理，这里只管把结果转成总线消息。 */
+        app_mem_log_brief("对话前");
         s_llm_reply[0] = '\0';
-        err = app_llm_chat(s_asr_text, s_llm_reply, sizeof(s_llm_reply));
+        err = app_llm_chat_stream(s_asr_text, net_llm_delta_cb, NULL,
+                                  s_llm_reply, sizeof(s_llm_reply));
+
+        /* 顺序很重要：先投“结果”，再投“流结束”。
+         *   - app_key_task 收到结果时，界面通常还在逐字显示 → 它会先进 AI_TYPING 等着；
+         *   - 界面收到 AI_END 才把剩下的字打完，然后回报 TYPING_DONE → 回待机。
+         * 反过来先发 AI_END 的话，界面可能已经把字打完并回报完成，
+         * 那时状态机才收到结果，就会把状态重新推成 AI_TYPING 而永远等不到回报。 */
         if (err == ESP_OK) {
             app_bus_post_llm(true, s_llm_reply);
         } else {
             ESP_LOGW(TAG, "LLM 失败: %s（%s）", esp_err_to_name(err), s_llm_reply);
             app_bus_post_llm(false, s_llm_reply);
         }
+        app_bus_post_chat(CHAT_MSG_AI_END, NULL);
     }
 }

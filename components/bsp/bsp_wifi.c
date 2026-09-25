@@ -288,7 +288,22 @@ esp_err_t bsp_wifi_init(void)
         .policy = WIFI_COUNTRY_POLICY_AUTO,
     };
     esp_wifi_set_country(&country);     /* 失败不影响使用，不当作致命错误 */
-    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    /*
+     * 省电模式：用 WIFI_PS_MIN_MODEM，不要用 WIFI_PS_NONE。
+     *
+     * 现象（踩过的坑）：连接手机/路由热点时，空闲十几秒后 AP 主动把设备踢下线，
+     *   日志是 “与 AP 断开连接, reason=4”，紧接着 TLS 握手报
+     *   “mbedtls_ssl_handshake returned -0x004C”（= MBEDTLS_ERR_NET_RECV_FAILED），
+     *   于是第一次说话必然识别失败。
+     *
+     * 原因：WIFI_PS_NONE 表示“永不休眠”，但设备空闲时**一个包都不发**，
+     *   部分 AP 会把长时间没有任何帧的客户端当成僵尸终端清掉（reason=4 就是
+     *   “due to inactivity”）；而 MIN_MODEM 会在 DTIM 周期醒来收 beacon
+     *   并回一个 NULL 数据帧，AP 就认为终端还活着，不会踢。
+     *   代价只是平均电流略高一点，对插电/充电宝供电的手持设备没有影响。
+     */
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
     /* 8. 启动 WiFi */
     err = esp_wifi_start();

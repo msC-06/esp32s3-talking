@@ -7,6 +7,7 @@
 
 #include "app_chat_history.h"
 #include "app_config.h"
+#include "app_gb2312.h"
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -102,7 +103,13 @@ esp_err_t app_chat_history_add(const char *role, const char *content)
     size_t len = strlen(content);
     if (len >= APP_CHAT_HISTORY_MSG_MAX) {
         len = APP_CHAT_HISTORY_MSG_MAX - 1;
-        ESP_LOGW(TAG, "消息过长，截断到 %d 字节", APP_CHAT_HISTORY_MSG_MAX - 1);
+        /* 按**完整 UTF-8 字符**收尾：content[len] 是第一个“没被收进来”的字节，
+         * 如果它是 0b10xxxxxx 续字节，说明正好切在汉字中间，往回收。
+         * 半个汉字进了请求体 JSON，服务端会直接回 400。 */
+        while (len > 0 && (((unsigned char)content[len]) & 0xC0U) == 0x80U) {
+            len--;
+        }
+        ESP_LOGW(TAG, "消息过长，截断到 %d 字节（按字符边界）", (int)len);
     }
 
     char *copy = (char *)pvPortMalloc(len + 1);
@@ -139,7 +146,7 @@ const app_chat_msg_t *app_chat_history_get(int index)
     return &s_msgs[index];
 }
 
-esp_err_t app_chat_history_to_json(cJSON *messages)
+esp_err_t app_chat_history_to_json(cJSON *messages, size_t budget_bytes)
 {
     if (messages == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -148,7 +155,29 @@ esp_err_t app_chat_history_to_json(cJSON *messages)
         xSemaphoreTake(s_lock, portMAX_DELAY);
     }
 
-    for (int i = 0; i < s_count; i++) {
+    /*
+     * 先算“从哪条开始带”：从最新往最老回溯累加，超出预算的更老消息就不带了。
+     * 一直保证**最新的一条一定带**（哪怕它自己就超预算），否则本轮问题都丢了。
+     * 估算里给每条加了 32 字节的 JSON 包装开销（{"role":"","content":""}, 等）。
+     */
+    int    start = s_count;
+    size_t used  = 0;
+    while (start > 0) {
+        const app_chat_msg_t *m   = &s_msgs[start - 1];
+        size_t                cost = (m->content != NULL ? strlen(m->content) : 0) +
+                                     strlen(m->role) + 32;
+        if (budget_bytes > 0 && (used + cost) > budget_bytes && start < s_count) {
+            break;
+        }
+        used += cost;
+        start--;
+    }
+    if (start > 0) {
+        ESP_LOGI(TAG, "历史预算 %u 字节：只带最近 %d/%d 条（约 %u 字节）",
+                 (unsigned)budget_bytes, s_count - start, s_count, (unsigned)used);
+    }
+
+    for (int i = start; i < s_count; i++) {
         cJSON *item = cJSON_CreateObject();
         if (item == NULL) {
             break;

@@ -27,9 +27,9 @@ EXT_RAM_BSS_ATTR static char s_gb_tmp[GB_TMP_MAX];
 /* ============================ 内部函数 ============================ */
 
 /**
- * @brief  判断 UTF-8 字符占几个字节（只按首字节判断，用于安全截断）
+ * @brief  判断 UTF-8 字符占几个字节（只按首字节判断，用于安全截断/逐字追加）
  */
-static int utf8_char_bytes(unsigned char c)
+int app_utf8_char_bytes(unsigned char c)
 {
     if (c < 0x80U) {
         return 1;
@@ -90,10 +90,23 @@ size_t app_text_truncate_utf8(const char *utf8, char *out, size_t out_size, uint
     const uint8_t  *p     = (const uint8_t *)utf8;
 
     while (p[src] != '\0') {
-        int    bytes = utf8_char_bytes(p[src]);
+        int    bytes = app_utf8_char_bytes(p[src]);
         size_t room  = out_size - 1U - dst;         /* 留一个字节放 '\0' */
         if ((size_t)bytes > room) {
             break;                                  /* 输出缓冲放不下 */
+        }
+
+        /* 尾巴不完整（多字节字符被上游切开了）：立刻停。
+         * 不检查的话下面会把 '\0' 一起拷走，然后 src 越过结尾继续读越界内存。 */
+        bool complete = true;
+        for (int i = 1; i < bytes; i++) {
+            if (p[src + i] == '\0') {
+                complete = false;
+                break;
+            }
+        }
+        if (!complete) {
+            break;
         }
 
         uint32_t char_w = (p[src] < 0x80U) ? APP_FONT_HALF_W : APP_FONT_FULL_W;

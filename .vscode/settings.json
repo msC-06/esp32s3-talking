@@ -34,5 +34,6 @@
     "ADF_PATH": "C:\\Espressif\\tools\\esp-adf"
   },
   "idf.portWin": "COM14",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.port": "COM14"
 }

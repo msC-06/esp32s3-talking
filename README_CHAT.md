@@ -90,10 +90,12 @@ idf.py -p COMx flash monitor
    PCM 写进 PSRAM 缓冲（最大 15 秒 = 480000 字节）。按住超过 15 秒会自动停止录音。
 3. **松开**：状态行「识别中...」，PCM 交给网络任务上传百度 ASR。
 4. 识别文本作为用户气泡显示在右侧，状态行「AI 正在回复...」，于是请求 DeepSeek。
-5. AI 回复显示为左侧气泡，状态回到「按住按键说话」。
+5. AI 回复**逐字冒出来**（SSE 流式 + 打字机效果，见第七节），显示完后状态回到「按住按键说话」。
+   打字期间按键不生效（状态是 `AI_TYPING`），避免用户对着半句话追问；
+   万一「显示完」的回报丢了，90 秒兜底强制回待机（`APP_CHAT_TYPING_TIMEOUT_MS`）。
 6. 任何一步出错都会在状态行红色显示原因（网络超时 / 密钥未配置 / 音频太短 …），并回到待机。
 
-气泡最多保留 12 条，超出自动删除最老的（LVGL 堆只有 64KB，不能无限堆）。
+气泡最多保留 10 条（`APP_CHAT_MAX_BUBBLES`），超出自动删除最老的（LVGL 堆只有 64KB，不能无限堆）。
 
 ## 四、目录与分层
 
@@ -115,7 +117,8 @@ components/app/                  应用层
   app_wifi.c/h                   ★WiFi(STA) 任务
   app_net.c/h                    ★网络任务：ASR -> LLM
   app_asr.c/h                    ★百度短语音识别
-  app_llm.c/h                    ★DeepSeek 对话
+  app_llm.c/h                    ★DeepSeek 对话（流式 SSE + 工具调用）
+  app_time.c/h                   ★SNTP 对时 + 时间格式化（界面与大模型都用）
   app_chat_history.c/h           ★最近 10 轮对话历史
   app_chat_ui.c/h                ★LVGL 聊天界面
   app_gb2312.c/h                 ★utf8_to_gb2312() 与文本宽度工具
@@ -132,7 +135,8 @@ app 层不直接碰 I2C/I2S 寄存器，WiFi 走 `my_drivers/net`，按键电平
 | `app_wifi_task` | 0 | 5 | 4096 | WiFi 连接、断线 5 秒重连、状态上报界面 |
 | `app_net_task` | 0 | 5 | 8192 | 取录音 → 百度 ASR → DeepSeek → 投递结果 |
 | `app_key_task` | 1 | 4 | 4096 | 消费按键事件驱动状态机（IDLE→RECORDING→UPLOADING→LLM_REQUEST→IDLE） |
-| `app_audio_task` | 1 | 6 | 4096 | 命令驱动采集 PCM 到 PSRAM，松手后上交数据 |
+| `app_audio_task` | 1 | 6 | 5120 | 命令驱动采集 PCM 到 PSRAM，松手后上交数据 |
+| `app_time`（对时） | 0 | 3 | 3072 | 等 WiFi 连上 → SNTP 对时 → 每 6 小时复查（见第八节） |
 | `lvgl_port_task` | 1 | 已有 | 已有 | LVGL 刷新；聊天界面靠 lv_timer 在它的上下文里更新 |
 
 | 队列 | 方向 |
@@ -141,8 +145,9 @@ app 层不直接碰 I2C/I2S 寄存器，WiFi 走 `my_drivers/net`，按键电平
 | `audio_ctrl_queue` | app_key_task → app_audio_task |
 | `pcm_queue` | app_audio_task → app_net_task |
 | `asr_result_queue` | app_net_task → app_key_task |
-| `llm_result_queue` | app_net_task → app_key_task |
+| `llm_result_queue` | app_net_task → app_key_task（只报成功/失败，正文走 chat_msg_queue 流式投递） |
 | `chat_msg_queue` | 任意任务 → 聊天界面（LVGL 定时器消费） |
+| `ui_event_queue` | 聊天界面 → app_key_task（打字机“显示完了”回报） |
 
 按键扫描用 `esp_timer` 20ms 周期回调（精度不受任务调度影响），
 消抖状态机：`IDLE → DEBOUNCE_PRESS → PRESSED → DEBOUNCE_RELEASE → RELEASED`，
@@ -167,6 +172,20 @@ app 层不直接碰 I2C/I2S 寄存器，WiFi 走 `my_drivers/net`，按键电平
   同一段只派发一次），再由 `app_http_pump()` 把 socket 抽干；
   解析失败时会把完整响应体打出来，便于定位。
 - **对话历史**：内存里保留最近 10 轮（20 条），开机清空；请求时自动拼 `system + 历史 + 新 user`。
+- **流式回复（SSE）**：请求 DeepSeek 时带 `stream: true`，
+  响应是 `data: {...}` 一行一条的 SSE。`app_http.c` 提供了「按行回调」
+  （`app_http_set_line_cb()`），`app_llm.c` 在每一行里取 `choices[0].delta.content`，
+  取到一段就立刻回调出去 —— 这就是打字机的数据源。
+  流式拿不到任何内容时自动降级为整段请求（把整段当一段“增量”回调），
+  界面逻辑不用区分两种情况；但**一旦已经送过字就不再降级**，
+  否则会出现“前半截流式 + 后半截整段”的重复文字。
+  细节见第七节。
+- **UTF-8 边界（这个坑很深）**：所有“按字节截断”的地方都必须回退到字符边界，
+  否则会出现半个汉字，而半个汉字送进 JSON 请求体会让服务端直接回 `400 Invalid UTF-8`。
+  涉及的函数：`app_utf8_char_bytes()`（判字符长度）、
+  `bus_copy_text()`（总线拷贝）、`app_chat_history_add()`（历史截断）、
+  `ws_append()`（联网搜索结果拼接）、`ui_type_push()`（打字机目标文本）。
+  排查方法：日志里出现 `HTTP 400` + 服务端说 `Invalid UTF-8`，就是这里。
 - **中文显示**：HZK16 是 GB2312 点阵，LVGL 的 hzk16 字体内部已经做了 Unicode→GB2312 转换，
   所以 label 直接喂 UTF-8 即可；`utf8_to_gb2312()` 用于按点阵宽度估算/截断文本。
 - **TLS**：默认用 IDF 内置根证书包校验（`APP_TLS_USE_CA_BUNDLE=1`）。
@@ -174,30 +193,149 @@ app 层不直接碰 I2C/I2S 寄存器，WiFi 走 `my_drivers/net`，按键电平
   `CONFIG_ESP_TLS_INSECURE` / `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY` 打开，
   并把 `APP_TLS_USE_CA_BUNDLE` 改成 0。
 
-## 七、常见问题排查
+## 七、流式回复（SSE）与打字机效果
+
+目标：AI 的话**一段一段冒出来**，而不是等 5 秒后整段砸在屏幕上。
+分两件事：**网络侧流式收包**（`app_llm.c` + `app_http.c`）和
+**界面侧逐字显示**（`app_chat_ui.c`）。
+
+### 7.1 网络侧：SSE 一行一行解析
+
+```
+请求体带 "stream": true  →  响应是一串 SSE：
+   data: {"choices":[{"delta":{"content":"你"},"index":0}]}
+   data: {"choices":[{"delta":{"content":"好"}}]}
+   ...
+   data: [DONE]
+```
+
+- `app_http.c` 新增 `app_http_set_line_cb()`：收包时按 `\n` 切行，
+  每凑够一整行就回调一次（缓冲 `s_sse_line[APP_HTTP_SSE_LINE_MAX]`，
+  行太长会丢弃并告警）；**同时仍然把整个响应累积到原来的 buffer 里**，
+  所以整段解析的老逻辑完全不受影响。
+- `app_llm.c` 的 `llm_sse_line()` 逐行用 cJSON 解析，取
+  `choices[0].delta.content` 追加到 `s_stream`（累积全文）并立刻回调上层。
+- **流式下的工具调用**：`tool_calls` 在流式里是**分片**下发的
+  （先给 `id`/`name`，`arguments` 字符串一点点拼），所以 `s_stream.tools[]`
+  按 `index` 累积片段，收完再一次性执行搜索，然后带结果**再发一次流式请求**
+  （`llm_stream_restart()` 重置收包状态但保留回调与已累积正文）。
+- 降级策略：整轮流式没拿到正文也没拿到工具调用 → 记 `AI无响应(流式)`，
+  `app_llm_chat_stream()` 看到「没往界面送过字」就重发一次非流式请求。
+
+### 7.2 界面侧：打字机（逐字显示）
+
+```
+app_net_task 收包 → net_llm_delta_cb() → CHAT_MSG_AI_DELTA →(队列)→ LVGL 定时器
+                                                            ↓
+                    追加进 s_type_target（目标全文，1KB，UTF-8 安全截断）
+                                                            ↓
+        30ms 定时器：每 APP_CHAT_TYPE_INTERVAL_MS(100ms) 从目标里取 1 个汉字
+        （ASCII 算 1/3 个汉字）刷到 label，并 lv_obj_scroll_to_view 滚到底部
+                                                            ↓
+              收到 CHAT_MSG_AI_END → 把剩下的字一次补完 → 回报 TYPING_DONE
+```
+
+几个关键设计：
+
+| 点 | 做法 / 原因 |
+| --- | --- |
+| 只在 LVGL 任务里碰控件 | 网络任务的回调只投队列（`app_bus_post_chat`），跨线程操作控件会随机崩 |
+| 增量消息不丢 | `CHAT_MSG_AI_DELTA` 投递时会等队列空位（最多 300ms），丢一段就是回复缺字 |
+| 目标文本裁剪 | 按 **完整 UTF-8 字符**截断，绝不留半个汉字（`ui_type_push()`） |
+| label 只显示前缀 | 临时把 `s_type_target[s_type_shown]` 置 `'\0'` 后 `lv_label_set_text()`，刷完恢复 |
+| 换行排版只切一次 | 文字超过气泡宽度才切成 `WRAP` 并定宽，避免每帧抖动 |
+| 输入被锁住 | 打字期间状态是 `APP_STATE_AI_TYPING`，`app_key_task` 直接忽略按下 |
+| 兜底 | `APP_CHAT_TYPING_TIMEOUT_MS`(90s) 内没收到 TYPING_DONE 就强制回待机 |
+| 追赶 | 积压超过 `APP_CHAT_TYPE_CATCHUP_BYTES`(120B) 自动加速（每档 +1 字，最多 8 字/次） |
+
+调参都在 `app_config.h`：`APP_CHAT_TYPE_INTERVAL_MS`（快慢）、
+`APP_CHAT_TYPE_UNITS`（每次几个字）、`APP_CHAT_TYPE_CATCHUP_BYTES`（设 0 关闭追赶）、
+`APP_CHAT_UI_TICK_MS`（定时器周期，默认 30ms）、`APP_CHAT_TYPING_TIMEOUT_MS`。
+
+> ⚠️ **顺序有个坑**：`app_net` 必须先投 `llm_result`，再投 `CHAT_MSG_AI_END`。
+> 反过来先发 AI_END 的话，界面可能已经把字打完并回报完成，
+> 状态机这时才收到结果，就会把状态推成 `AI_TYPING` 而永远等不到回报 —— 按键就此失灵。
+
+## 八、系统时间（SNTP 对时，`app_time.c`）
+
+**为什么要它**：ESP32-S3 没有带电池的 RTC，开机时间是 1970-01-01。
+大模型自己不知道“现在”，于是问它「今天是几号」，它会一本正经地编一个日期
+（本工程实测：答成「2025年6月13日，星期五」）。加上对时后：
+system 提示词里会带上真实日期时间，界面待机提示也会显示 `HH:MM`。
+
+### 8.1 怎么工作
+
+```
+app_start() → app_time_start()              创建对时任务（Core 0 / 优先级 3 / 栈 3072）
+                    ↓
+      对时任务循环：app_wifi_is_connected()？没有就连 1 秒等一次
+                    ↓ 有链路
+      app_time_sync_once(15s)：esp_sntp_restart() → 等 time() 晚于 2020-01-01
+                    ↓ 成功                        ↓ 失败
+            记日志、等 6 小时再复查          等 30 秒重试
+```
+
+| 接口 | 用途 |
+| --- | --- |
+| `app_time_is_synced()` | 时间是否可信（SNTP 回调触发过，或 `time()` 晚于 2020-01-01） |
+| `app_time_now_str(buf, len)` | `2026-09-25 16:30:12 星期四` |
+| `app_time_now_clock(buf, len)` | `16:30`（界面状态行用） |
+| `app_time_format(buf, len, fmt)` | `strftime` 包装，例如 `"%Y/%m/%d"` |
+| `app_time_llm_text(buf, len)` | 给大模型的一句话；**没对时时返回“不知道当前时间”**而不是 1970 |
+| `app_time_wait_synced(ms)` | 阻塞等时间就绪（别的模块想立刻用时间时） |
+
+### 8.2 三个容易踩的点
+
+1. **不能等 lwip 自己的轮询周期**：`CONFIG_LWIP_SNTP_UPDATE_DELAY` 默认 1 小时，
+   开机时 WiFi 还没连上、第一次请求必然失败，那就要等一小时。
+   本模块自己管重试节奏（30 秒一次），每次重试都主动 `esp_sntp_restart()`。
+   → 顺带把 `CONFIG_LWIP_SNTP_MAX_SERVERS` 从 1 改成 3，可以配三个 NTP 服务器。
+2. **时区必须先设**：`setenv("TZ", APP_TIME_TZ, 1); tzset();`，
+   `APP_TIME_TZ` 默认 `"CST-8"`（东八区，注意符号是反的），
+   否则你会看到 UTC 时间（比北京时间晚 8 小时）。
+3. **没对时时不要编时间**：`app_time_llm_text()` 在未同步时给的是
+   “设备还没和网络对时，你不知道当前日期和时间”，
+   这样模型会老实说自己无法确定，而不是把 1970 当答案。
+
+> 证书校验与时间的关系：本工程 `CONFIG_MBEDTLS_HAVE_TIME_DATE` 是**关**的，
+> 也就是 mbedtls 不校验证书的有效期，所以“时间还是 1970”也能正常 TLS 握手。
+> 如果你哪天把这项打开，就必须先对时再发 HTTPS 请求（否则全部握手失败）。
+
+## 九、常见问题排查
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
 | 状态行「未配置SSID」 | `app_config.h` 里 `APP_WIFI_SSID` 还是占位符 |
 | 状态行「获取token失败」 | 看 `APP_ASR` 日志：`error:invalid_client` = Key 填错；若出现「响应超过缓冲上限」= 加大 `s_token_resp` |
+| 状态行「取token超时，请重试」 | 链路慢/刚断线重连，代码已自动重试一次；若持续出现，看下面那条「空闲十几秒被踢下线」 |
+| 状态行「百度鉴权失败(检查Key)」 | Key/Secret 不对，或「短语音识别」服务没开通 |
+| 状态行「未配置百度密钥」 | `app_config_secret.h` 里 `BAIDU_ASR_*` 还是占位符 |
+| **空闲十几秒后第一次说话必失败**：日志 `与 AP 断开连接, reason=4` + `mbedtls_ssl_handshake returned -0x004C` | `reason=4` = AP 认为终端不活跃把它踢了（`WIFI_PS_NONE` 空闲时一个包都不发）；`-0x004C` = `MBEDTLS_ERR_NET_RECV_FAILED`。已改成 `WIFI_PS_MIN_MODEM`（bsp_wifi.c），并加了「识别失败且链路已断 → 等重连再重试」的兜底。若仍出现，换热点（实测 PC 热点不踢人，部分手机热点/WPA3 路由器会踢） |
+| 日志 `getaddrinfo() returns 202` | 202 = lwip 的 `EAI_FAIL`，DNS 查询失败。已在 `sdkconfig.defaults` 打开 lwip 备用 DNS（`223.5.5.5`），主 DNS 不响应时自动切换 |
+| 日志 `wifi:sta is connected, disconnect before connecting to new ap` | app 层和 bsp 层同时在调 `esp_wifi_connect()` 互相打架（会把已连上的链路断开重来）。已改成 app 层只在开机连一次 + 掉线超过 20 秒才补连一次 |
 | 状态行「识别失败: 音频质量太差(3301)」 | 录音太小/太吵：确认对着板载麦克风说话，或调 `audio_set_mic_gain()`（默认 24dB） |
 | 状态行「识别失败: 音频过短(3308)」 | 按住时间太短，多说一会儿（代码里 <400ms 的录音直接丢弃） |
 | 状态行「识别失败: 鉴权失败(3302)」 | token 失效，代码会自动重取一次；仍失败说明 Key 无效或服务未开通 |
 | 状态行「AI网络连接失败」 | 看 `APP_LLM` 日志；确认能访问 `api.deepseek.com`、Key 有效、账户有余额 |
 | 状态行「AI服务错误: ...」 | 直接是 DeepSeek 返回的错误文本（额度/密钥/参数） |
+| 日志 `流式没拿到内容…降级为一次性返回` | 服务端没给 SSE（或中途断了）：会自动整段请求一次，属正常兜底；若每次都这样，检查是否开了代理 |
+| 回复缺字 / 只显示半句 | 看是否有 `聊天队列持续满，丢了 N 字节流式增量`；这是内部堆紧张导致界面来不及消费，先按 11.4 节释放内部 RAM |
+| AI 答的日期是编的（例如问“今天几号”答成 2025 年） | 时间没对上：看有没有 `APP_TIME: 时间同步成功`。没有的话确认能访问 `ntp.aliyun.com`（UDP 123 不被热点屏蔽），或改 `APP_TIME_SNTP_SERVER1` |
+| 界面时间比实际早/晚 8 小时 | 时区不对：`APP_TIME_TZ` 应为 `"CST-8"`（东八区，符号是反的） |
+| `APP_TIME: 时间同步失败` 反复出现 | NTP 用的是 UDP 123，某些热点/校园网会拦；可先换成 `ntp.tencent.com`、`time.windows.com` 试，或忽略它（只有日期问答受影响） |
 | 中文显示成方框 | `hzk16.bin` 没烧进 `fontbin` 分区，重新 `idf.py flash` |
 | 录不到声音 / 全是静音 | 板载麦克风是 ES7210，确认 `audio_init()` 与 `audio_mic_init()` 都成功（看 `audio` 标签日志） |
 
-## 八、小游戏框架
+## 十、小游戏框架
 
 原来的游戏中心（`game_launcher/`、`games/game_2048/`）代码完整保留。
 聊天界面会新建并加载自己的 screen，会和游戏主页抢屏，
 所以 `main/main.c` 里用 `APP_ENABLE_GAME_LAUNCHER` 开关控制，默认 `0`（不启动游戏框架）。
 想同时保留，把它改成 1 即可。
 
-## 九、内存布局与缓冲大小
+## 十一、内存布局与缓冲大小
 
-### 9.1 大文本缓冲全部放 PSRAM
+### 11.1 大文本缓冲全部放 PSRAM
 
 板子有 8MB PSRAM，而内部 DIRAM 只有 ~334KB，还要留给任务栈、队列、WiFi/TLS 的运行时分配。
 所以**大块文本缓冲一律用 `EXT_RAM_BSS_ATTR` 放进 PSRAM**（`sdkconfig` 里开了
@@ -207,17 +345,19 @@ app 层不直接碰 I2C/I2S 寄存器，WiFi 走 `my_drivers/net`，按键电平
 | --- | --- | --- | --- |
 | `s_asr_resp` / `s_token_resp` | 8KB / 6KB | PSRAM | 百度识别 / token 响应（token 响应实测 1.4KB 且是 chunked） |
 | `s_asr_prefix` / `s_token_url` | 1KB / 512B | PSRAM | 拼请求用 |
-| `s_asr_text` / `s_llm_reply` | 4KB / 4KB | PSRAM | ASR 文本 / AI 回复（一轮回复的硬上限 `APP_TEXT_MAX_LEN`） |
-| `s_tool_results[2]` | 10.5KB | PSRAM | Function Calling 工具结果（每条 5KB） |
+| `s_asr_text` / `s_llm_reply` | 2KB / 2KB | PSRAM | ASR 文本 / AI 回复（一轮回复的硬上限 `APP_TEXT_MAX_LEN`） |
+| `s_tool_results[2]` | ~10KB | PSRAM | Function Calling 工具结果（每条 `APP_WEB_SEARCH_TEXT_MAX+1` = 5KB） |
 | `s_gb_tmp` | 4KB | PSRAM | UTF-8→GB2312 宽度估算 |
 | `APP_LLM_RESP_BUF_SIZE` | 32KB | PSRAM（堆） | DeepSeek 响应，每次调用分配/释放 |
 | `APP_WEB_SEARCH_RESP_BUF_SIZE` | 64KB | PSRAM（堆） | Tavily 响应，每次调用分配/释放 |
+| `s_type_target` | 1KB | 内部 RAM（静态） | 打字机的目标全文（界面模块唯一的大静态量） |
+| `s_bubble_text` / `s_rx_msg`（界面、按键各一份） | 1KB×3 | 内部 RAM（静态） | 气泡裁剪缓冲、队列接收缓冲（**不能放栈上**） |
 | `APP_CHAT_BUBBLE_TEXT_MAX` | 1KB/气泡 | **LVGL 内存池** | 只有它必须在 LVGL 池里（`CONFIG_LV_MEM_SIZE`） |
 
 队列是运行时堆内存（内部 RAM），也按文本长度算过账：
-`asr 2×4KB + llm 2×4KB + chat 8×2KB ≈ 33KB`。
+`asr 2×2KB + llm 2×2KB + chat 6×1KB + ui 4×4B ≈ 14KB`。
 
-### 9.2 内存监控：空闲任务触发 + 监控任务上报（`app_mem.c`）
+### 11.2 内存监控：空闲任务触发 + 监控任务上报（`app_mem.c`）
 
 分工（这点很重要，见下面的“坑”）：
 
@@ -253,7 +393,7 @@ W (xxx) APP_MEM: 内部 RAM 只剩 20 KB（阈值 24 KB）：建议调小 APP_TE
 `APP_MEM_LOG_ENABLE=0` 直接关掉、`APP_MEM_WARN_*` 改告警阈值、
 `APP_MEM_TASK_PRIO` / `APP_MEM_TASK_STACK` 调监控任务本身。
 
-### 9.3 任务栈监控与"栈炸弹"（踩过的大坑）
+### 11.3 任务栈监控与"栈炸弹"（踩过的大坑）
 
 第二条日志里会多一行各任务栈剩余量（历史最小值，来自 `uxTaskGetStackHighWaterMark`）：
 
@@ -288,11 +428,11 @@ grep -h -P '\t\d+\t' build/esp-idf/app/CMakeFiles/__idf_app.dir/*.su \
   | awk -F'\t' '{print $2, $1}' | sort -rn | head -20
 ```
 
-修复前后对比：最大栈帧从 **4104 字节** 降到 **576 字节**，
+修复前后对比：最大栈帧从 **4104 字节** 降到 **560 字节**（`llm_execute_tools`），
 各任务入口函数（`app_net_task`/`app_audio_task`/`app_key_task`/`ui_timer_cb`）都在 64 字节以内。
 新增代码后建议跑一次这个命令，只要没有几百字节以上的栈帧就很安全。
 
-### 9.4 文本缓冲尺寸怎么定（稳定优先）
+### 11.4 文本缓冲尺寸怎么定（稳定优先）
 
 内部堆只有 ~139KB，还要养任务栈（~20KB）、WiFi/LWIP（~40KB）、TLS 连接（~22KB）。
 **队列是内部堆内存**，所以"把文本缓冲改大"最容易踩的坑就是把内部堆挤干——
@@ -303,12 +443,12 @@ grep -h -P '\t\d+\t' build/esp-idf/app/CMakeFiles/__idf_app.dir/*.su \
 
 | 项 | 值 | 在哪里占内存 |
 | --- | --- | --- |
-| `s_token_resp` | 4096（百度实际响应 ~1.4KB） | PSRAM（`EXT_RAM_BSS_ATTR`） |
-| `s_asr_resp` | 4096 | PSRAM |
+| `s_token_resp` | 6KB（百度实际响应 ~1.4KB） | PSRAM（`EXT_RAM_BSS_ATTR`） |
+| `s_asr_resp` | 8KB | PSRAM |
 | `APP_TEXT_MAX_LEN` | 2048（≈1000 汉字） | asr/llm 队列，内部堆 2×2KB |
 | `APP_CHAT_TEXT_MAX` | 1024 | chat 队列，内部堆 6×1KB |
 | `APP_CHAT_BUBBLE_TEXT_MAX` | 1024 | LVGL 池（64KB，实测占用 ~14%） |
-| 三个队列合计 | **14.4KB** | 内部堆（改大前激进版是 32.8KB） |
+| 三个队列合计 | **≈14KB** | 内部堆（改大前激进版是 32.8KB） |
 | `APP_LLM_RESP_BUF_SIZE` | 32KB | PSRAM 堆（每次请求分配/释放） |
 | `APP_WEB_SEARCH_RESP_BUF_SIZE` | 64KB | PSRAM 堆 |
 | 工具结果 `s_tool_results[2]` | 2×5KB | PSRAM |
@@ -317,11 +457,17 @@ grep -h -P '\t\d+\t' build/esp-idf/app/CMakeFiles/__idf_app.dir/*.su \
 `APP_TEXT_MAX_LEN` 之外那几个 `EXT_RAM_BSS_ATTR` 缓冲）；
 动队列尺寸前先看日志里的"内部空闲 / 最大块"，留出 30KB 以上余量再动。
 
-**ASR 上传失败会自动重试**：传输层失败（没拿到服务端响应，例如上传中途链路卡死）
-会换一条新连接重试一次，避免一次网络抖动报废整轮对话；日志里能看到
-`没拿到服务端响应（上传失败），1 秒后换新连接重试一次`。
+**ASR 上传失败会自动重试**（两级，见 `app_asr.c`）：
 
-### 9.5 双核任务分配（含 LVGL 任务，别让它被网络任务饿死）
+1. 取 token 超时 → 等 1 秒重试一次；
+2. 识别没拿到服务端响应（传输层失败，例如上传中途链路卡死）
+   → **链路正常**就等 1.5 秒换新连接重试一次；
+      **链路已断**（`app_wifi_is_connected()` 为假，通常伴随 `reason=4` 被踢）则最多等
+     `APP_ASR_WAIT_LINK_MS`(15s) 让 WiFi 重连成功后再重试，等不到才报「WiFi 已断开」。
+
+日志里能看到 `没拿到服务端响应（上传失败），1.5 秒后换新连接重试一次`。
+
+### 11.5 双核任务分配（含 LVGL 任务，别让它被网络任务饿死）
 
 | 核心 | 任务（优先级） |
 | --- | --- |
@@ -337,20 +483,22 @@ grep -h -P '\t\d+\t' build/esp-idf/app/CMakeFiles/__idf_app.dir/*.su \
 现在在 `lcd.c` 里显式指定：`lvgl_cfg.task_affinity = 1; lvgl_cfg.task_priority = 5;`
 （`LCD_LVGL_TASK_CORE` / `LCD_LVGL_TASK_PRIO`）。
 
-**对话上屏时序**（改完后）：
+**对话上屏时序**（改完后，含流式与打字机）：
 
 ```
-松手 → 状态“识别中...”          （app_key_task 切状态，30ms 内上屏）
+按住 GPIO0  → 状态“录音中... 松开发送”（30ms 内上屏）
+松手        → 状态“识别中...”
 百度返回识别结果
-     → 用户气泡立刻上屏 + 状态“AI 正在回复...”（app_net_task 直接投递，不等转发）
-几秒后 DeepSeek 返回
-     → AI 气泡上屏 + 状态回到“按住按键说话”
+     → 用户气泡立刻上屏 + 状态“AI 正在回复...”（app_net 直接投递，不等转发）
+DeepSeek 第一段正文到达（通常 1~2 秒）
+     → AI 气泡出现并开始**逐字**冒字（状态“输出中”）
+流结束      → 剩下的字打完 → 状态回到“按住按键说话”（这时才允许再次录音）
 ```
 
 注意：网络本身的耗时没变（TLS 握手 + 上传 + 模型推理），
-变的是**界面不再等网络**，所以"用户说的话"能先看到。
+变的是**界面不再等网络**：用户说的话先看到，AI 的话边生成边显示。
 
-### 9.6 注意事项
+### 11.6 注意事项
 
 - 打开 `.bss` 放 PSRAM 后，**PSRAM 变成硬依赖**：IDF 会把 `lwip`/`net80211` 等的
   `.bss` 一并放到 PSRAM（这是该选项的官方行为，也正是它省出 ~50KB DIRAM 的原因）。

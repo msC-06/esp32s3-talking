@@ -11,6 +11,8 @@
 #include "app_config.h"
 #include "app_http.h"
 #include "app_mem.h"
+#include "app_bus.h"                /* 链路重连时给界面发一条状态提示 */
+#include "app_wifi.h"               /* 重试前判断链路状态（App 层内互相调用允许） */
 
 #include "my_drivers/audio/audio_recorder.h"    /* 采样率常量 */
 
@@ -154,15 +156,21 @@ static esp_err_t asr_get_token(bool force)
     }
     esp_http_client_set_header(client, "Content-Type", "application/json");
 
-    esp_err_t err = ESP_FAIL;
+    esp_err_t err      = ESP_FAIL;
+    int64_t   t0       = esp_timer_get_time();
+    bool      timed_out = false;
+
     do {
         /* Content-Length: 0，参数都在 URL 里 */
-        if (esp_http_client_open(client, 0) != ESP_OK) {
-            ESP_LOGE(TAG, "连接 token 接口失败");
+        esp_err_t oerr = esp_http_client_open(client, 0);
+        if (oerr != ESP_OK) {
+            ESP_LOGE(TAG, "连接 token 接口失败：%s", esp_err_to_name(oerr));
+            timed_out = (oerr == ESP_ERR_TIMEOUT) || (oerr == ESP_ERR_HTTP_CONNECT);
             break;
         }
         if (esp_http_client_fetch_headers(client) < 0) {
             ESP_LOGE(TAG, "读取 token 响应头失败");
+            timed_out = true;       /* fetch_headers 返回负数基本都是超时/连接被撕 */
             break;
         }
         int status = esp_http_client_get_status_code(client);
@@ -212,6 +220,35 @@ static esp_err_t asr_get_token(bool force)
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+
+    int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
+    if (err != ESP_OK) {
+        /* 分不清“网络慢/断”还是“Key 错”时看耗时：
+         * 接近超时时间的多半是链路问题，返回 ESP_ERR_TIMEOUT，
+         * 让上层重试一次，而不是直接甩给用户一句“检查密钥”。 */
+        if (timed_out || elapsed_ms >= (int64_t)(BAIDU_ASR_TOKEN_TIMEOUT_MS * 8 / 10)) {
+            ESP_LOGW(TAG, "取 token 失败（耗时 %lld ms，判定为超时/链路问题）", (long long)elapsed_ms);
+            return ESP_ERR_TIMEOUT;
+        }
+        ESP_LOGE(TAG, "取 token 失败（耗时 %lld ms，判定为鉴权/参数问题）", (long long)elapsed_ms);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "取 token 耗时 %lld ms", (long long)elapsed_ms);
+    return ESP_OK;
+}
+
+esp_err_t app_asr_prefetch_token(void)
+{
+    if (app_asr_has_token()) {
+        return ESP_OK;
+    }
+    esp_err_t err = asr_get_token(false);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "开机预热：百度 token 已就绪（第一次识别不用再等）");
+    } else {
+        ESP_LOGW(TAG, "开机预热取 token 失败：%s（第一次识别时会自动再试）", esp_err_to_name(err));
+    }
     return err;
 }
 
@@ -421,10 +458,31 @@ esp_err_t app_asr_recognize(const int16_t *pcm, size_t bytes, char *out, size_t 
         return ESP_ERR_INVALID_SIZE;
     }
 
-    /* 1. token（缓存命中直接用） */
+    int64_t t_start = esp_timer_get_time();
+
+    /* 1. token（缓存命中直接用；开机已经预热过，这里通常是 0 秒返回） */
     esp_err_t err = asr_get_token(false);
+
+    /* 1.1 取 token 超时：多半是刚断线重连后的第一包，等 1 秒再试一次 */
+    if (err == ESP_ERR_TIMEOUT) {
+        ESP_LOGW(TAG, "取 token 超时，1 秒后重试一次");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        err = asr_get_token(false);
+    }
+
     if (err != ESP_OK) {
-        snprintf(out, out_size, "获取token失败(检查密钥)");
+        /* 三种失败分开报，用户/开发者一眼能看出该改什么 */
+        if (err == ESP_ERR_INVALID_STATE) {
+            snprintf(out, out_size, "未配置百度密钥");
+        } else if (err == ESP_ERR_TIMEOUT) {
+            snprintf(out, out_size, "取token超时，请重试");
+        } else if (err == ESP_ERR_NO_MEM) {
+            snprintf(out, out_size, "内存不足");
+        } else {
+            snprintf(out, out_size, "百度鉴权失败(检查Key)");
+        }
+        ESP_LOGE(TAG, "取 token 失败：%s（%s，耗时 %lld ms）", esp_err_to_name(err), out,
+                 (long long)((esp_timer_get_time() - t_start) / 1000));
         return err;
     }
 
@@ -443,11 +501,25 @@ esp_err_t app_asr_recognize(const int16_t *pcm, size_t bytes, char *out, size_t 
 
     /* 4. 传输层失败（err_no 仍是 -1：压根没拿到服务端响应，
      *    例如上传中途链路卡死 → “Poll timeout … 写请求体失败”）。
-     *    这种多半是一次网络抖动，换一条新连接重试一次，别直接报废整轮对话。 */
+     *    这种多半是一次网络抖动，换一条新连接重试一次，别直接报废整轮对话。
+     *    如果链路本身就断了（详情里的 reason=4 / mbedtls -0x4C 那种），
+     *    先等 WiFi 重新连上再重试，否则必然再失败一次。 */
     if (ret != ESP_OK && err_no < 0) {
-        ESP_LOGW(TAG, "没拿到服务端响应（%s），1 秒后换新连接重试一次", out);
+        if (!app_wifi_is_connected()) {
+            ESP_LOGW(TAG, "识别失败且 WiFi 已断开，最多等 %d ms 等待重连后重试",
+                     APP_ASR_WAIT_LINK_MS);
+            app_bus_post_chat(CHAT_MSG_STATUS, "网络重连中，请稍候...");
+            if (!app_wifi_wait_connected(APP_ASR_WAIT_LINK_MS)) {
+                ESP_LOGE(TAG, "重连超时，本轮识别放弃：%s", out);
+                snprintf(out, out_size, "WiFi 已断开");
+                return ESP_ERR_INVALID_STATE;
+            }
+        } else {
+            ESP_LOGW(TAG, "没拿到服务端响应（%s），1.5 秒后换新连接重试一次", out);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+        }
+
         app_mem_log_brief("ASR 重试前");
-        vTaskDelay(pdMS_TO_TICKS(1000));
         err_no = -1;
         ret = asr_request(s_token, pcm, bytes, out, out_size, &err_no);
         if (ret != ESP_OK && err_no < 0) {
@@ -455,5 +527,9 @@ esp_err_t app_asr_recognize(const int16_t *pcm, size_t bytes, char *out, size_t 
             app_mem_log_brief("ASR 重试后仍失败");
         }
     }
+
+    ESP_LOGI(TAG, "识别结束：%s，总耗时 %lld ms",
+             (ret == ESP_OK) ? "成功" : esp_err_to_name(ret),
+             (long long)((esp_timer_get_time() - t_start) / 1000));
     return ret;
 }

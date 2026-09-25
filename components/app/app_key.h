@@ -15,7 +15,11 @@
  *        PRESS   -> 通知音频任务开始录音，状态 = RECORDING
  *        RELEASE -> 通知音频任务停止录音并上交 PCM，状态 = UPLOADING
  *        TIMEOUT -> 同 RELEASE（但不丢弃数据）
- *      同时消费 ASR / LLM 结果队列，把对话内容投递给界面，最后回到 IDLE。
+ *      同时消费 ASR / LLM 结果队列与界面回报事件：
+ *        ASR 失败 -> 报错回 IDLE；成功 -> 状态 = LLM_REQUEST
+ *        LLM 正文由网络任务直接以流式增量投给界面（本任务不重复显示），
+ *        本任务只做收尾：界面还在逐字显示就先停在 AI_TYPING 等它打完
+ *        （APP_UI_EVENT_TYPING_DONE 或超时兜底），再回 IDLE。
  */
 
 #ifndef __APP_KEY_H

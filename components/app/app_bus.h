@@ -11,8 +11,12 @@
  *   asr_result_queue  ASR 识别结果    app_net_task           -> app_key_task
  *   llm_result_queue  LLM 回复结果    app_net_task           -> app_key_task
  *   chat_msg_queue    聊天/状态消息   任意任务               -> app_chat_ui(LVGL 定时器)
+ *   ui_event_queue    界面回报事件     app_chat_ui            -> app_key_task
  *
  * 线程安全：本模块所有投递接口都可以在任意任务/定时器回调里调用。
+ *
+ * 关于栈：数组型消息（app_text_msg_t / chat_msg_t）都有 1KB 以上，
+ *         投递接口内部用静态暂存区 + 互斥锁拼包，**调用方不要把它们放局部变量**。
  */
 
 #ifndef __APP_BUS_H
@@ -34,12 +38,13 @@ extern "C" {
 
 /* ============================ 业务状态机 ============================ */
 
-/** 业务状态：IDLE -> RECORDING -> UPLOADING -> LLM_REQUEST -> IDLE */
+/** 业务状态：IDLE -> RECORDING -> UPLOADING -> LLM_REQUEST -> AI_TYPING -> IDLE */
 typedef enum {
     APP_STATE_IDLE = 0,         /*!< 待机：按住按键说话 */
     APP_STATE_RECORDING,        /*!< 录音中：采集 PCM */
     APP_STATE_UPLOADING,        /*!< 识别中：PCM 已投递给网络任务，正在调 ASR */
     APP_STATE_LLM_REQUEST,      /*!< AI 正在回复：正在调 DeepSeek */
+    APP_STATE_AI_TYPING,        /*!< 界面还在逐字显示上一条回复：不接受新的录音 */
 } app_state_t;
 
 /* ============================ 消息类型 ============================ */
@@ -78,8 +83,9 @@ typedef struct {
 
 /** 聊天消息类型（决定界面上显示在哪儿、什么样式） */
 typedef enum {
-    CHAT_MSG_USER = 0,          /*!< 用户消息气泡（右对齐，浅蓝） */
-    CHAT_MSG_AI,                /*!< AI 回复气泡（左对齐，浅灰） */
+    CHAT_MSG_USER = 0,          /*!< 用户消息气泡（右对齐，浅蓝，立即显示） */
+    CHAT_MSG_AI_DELTA,          /*!< AI 回复的流式增量（追加到打字机目标文本） */
+    CHAT_MSG_AI_END,            /*!< AI 回复流结束（打字机把剩余字打完就收尾） */
     CHAT_MSG_STATUS,            /*!< 底部状态行 */
     CHAT_MSG_ERROR,             /*!< 底部状态行（红色，显示几秒） */
     CHAT_MSG_WIFI,              /*!< 顶部 WiFi 状态 */
@@ -88,8 +94,13 @@ typedef enum {
 /** 聊天消息 */
 typedef struct {
     chat_msg_type_t type;                       /*!< 消息类型 */
-    char            text[APP_CHAT_TEXT_MAX];    /*!< 文本（UTF-8） */
+    char            text[APP_CHAT_TEXT_MAX];    /*!< 文本（UTF-8，AI_END 时可为空） */
 } chat_msg_t;
+
+/** 界面回报事件（app_chat_ui -> app_key_task） */
+typedef enum {
+    APP_UI_EVENT_TYPING_DONE = 0,   /*!< 打字机把本条回复显示完了 */
+} app_ui_event_t;
 
 /* ============================ 初始化 ============================ */
 
@@ -107,6 +118,7 @@ QueueHandle_t app_bus_pcm_queue(void);      /*!< 录音数据 */
 QueueHandle_t app_bus_asr_queue(void);      /*!< ASR 结果 */
 QueueHandle_t app_bus_llm_queue(void);      /*!< LLM 结果 */
 QueueHandle_t app_bus_chat_queue(void);     /*!< 聊天消息 */
+QueueHandle_t app_bus_ui_queue(void);       /*!< 界面回报事件（app_key_task 收） */
 
 /* ============================ 状态机 ============================ */
 
@@ -118,6 +130,17 @@ app_state_t app_bus_get_state(void);
 
 /** 状态对应的界面提示文字（如 "按住按键说话"） */
 const char *app_bus_state_text(app_state_t state);
+
+/* ============================ 打字机握手 ============================ */
+
+/**
+ * @brief  设置“界面是否正在逐字显示 AI 回复”标记
+ * @note  只有 LVGL 定时器回调（app_chat_ui）会写它，状态机读它来决定能否开始录音
+ */
+void app_bus_set_ui_typing(bool typing);
+
+/** 读取“界面是否正在打字” */
+bool app_bus_is_ui_typing(void);
 
 /* ============================ 投递接口 ============================ */
 
@@ -136,11 +159,18 @@ esp_err_t app_bus_post_asr(bool ok, const char *text);
 /** 投递 LLM 结果 */
 esp_err_t app_bus_post_llm(bool ok, const char *text);
 
-/** 投递一条聊天消息 */
+/**
+ * @brief  投递一条聊天消息
+ * @note   CHAT_MSG_AI_DELTA 是**不丢**的（等队列空位，否则流式回复会缺字）；
+ *         其余类型队列满时直接丢弃并记日志，界面少一条提示不影响业务。
+ */
 esp_err_t app_bus_post_chat(chat_msg_type_t type, const char *text);
 
 /** 投递一条聊天消息（printf 风格） */
 esp_err_t app_bus_post_chatf(chat_msg_type_t type, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+/** 通知状态机：界面已经把上一条 AI 回复显示完（app_chat_ui 内部调用） */
+esp_err_t app_bus_post_typing_done(void);
 
 #ifdef __cplusplus
 }

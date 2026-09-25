@@ -37,6 +37,7 @@ endif()
 #     app_gb2312.c                  UTF-8 <-> GB2312 与文本宽度工具
 #     app_http.c                    HTTP 响应体累积读取 + JSON 解析兜底
 #     app_web_search.c              Tavily 联网搜索（DeepSeek Function Calling 工具）
+#     app_time.c                    SNTP 对时 + 时间格式化（喂给界面与大模型）
 #     app_mem.c                     空闲任务里的内存监控（堆 / PSRAM / LVGL 池）
 #   小游戏（保留）
 #     game_launcher/                游戏管理器 + 主页 + 存档服务
@@ -57,6 +58,7 @@ idf_component_register(
         "app_gb2312.c"
         "app_http.c"
         "app_web_search.c"
+        "app_time.c"
         "app_mem.c"
         "game_launcher/game_manager.c"
         "game_launcher/launcher_ui.c"
@@ -79,6 +81,7 @@ idf_component_register(
         esp_common
         esp_event
         esp_netif
+        lwip
         heap
         nvs_flash
 )

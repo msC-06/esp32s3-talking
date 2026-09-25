@@ -14,6 +14,7 @@
 #include "app_net.h"
 #include "app_chat_ui.h"
 #include "app_mem.h"
+#include "app_time.h"
 
 #include "my_drivers/lcd.h"
 #include "my_drivers/audio/audio.h"
@@ -103,6 +104,14 @@ esp_err_t app_start(void)
     err = app_net_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "网络模块初始化异常: %s", esp_err_to_name(err));
+    }
+
+    /* ---------- 6.5 系统时间（SNTP 对时）----------
+     * 必须在网络任务跑起来之前/同时启动：它对时的结果会进 system 提示词
+     * （见 app_llm.c），也决定界面待机提示里那串 HH:MM 什么时候出现。
+     * 这里只是创建对时任务，它自己会等 WiFi 连上再发请求，不会阻塞启动。 */
+    if (app_time_start() != ESP_OK) {
+        ESP_LOGW(TAG, "时间模块启动失败，界面不显示时间、AI 也不知道当前日期");
     }
 
     /* ---------- 7. 创建四个任务（双核绑定） ---------- */

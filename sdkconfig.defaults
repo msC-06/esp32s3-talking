@@ -44,6 +44,18 @@ CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 
+# 备用 DNS 服务器：DHCP 给的 DNS 偶尔不响应/被劫持，
+# 日志现象是 getaddrinfo() returns 202（= lwip 的 EAI_FAIL，DNS 查询失败），
+# 于是 aip.baidubce.com / api.deepseek.com 全都解析不出来。
+# 打开 lwip 的 fallback DNS，主 DNS 失败时自动改用 223.5.5.5（阿里公共 DNS）。
+CONFIG_LWIP_FALLBACK_DNS_SERVER_SUPPORT=y
+CONFIG_LWIP_FALLBACK_DNS_SERVER_ADDRESS="223.5.5.5"
+
+# SNTP 对时（app_time.c）：可以配 3 个 NTP 服务器（原本只有 1 个槽位）。
+# 注意 UPDATE_DELAY 是 lwip 自己的重试周期（默认 1 小时），
+# 本工程不依赖它：对时任务连上 WiFi 后会主动 esp_sntp_restart() 重试。
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+
 # 初始化的 main 任务要建界面/开机动画，栈给大一点
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 

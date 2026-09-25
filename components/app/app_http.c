@@ -7,11 +7,55 @@
 #include <string.h>
 
 #include "app_http.h"
+#include "app_config.h"     /* APP_HTTP_SSE_LINE_MAX */
 
 #include "cJSON.h"
 #include "esp_log.h"
 
 static const char *TAG = "APP_HTTP";
+
+/* ============================ SSE 行缓冲 ============================ */
+
+/**
+ * 行缓冲放静态区
+ * @note  SSE 只有 app_llm 一个使用者，而且都在网络任务里串行执行，
+ *        所以静态缓冲是安全的（也避免在任务栈上占 1KB）。
+ */
+static char   s_sse_line[APP_HTTP_SSE_LINE_MAX];
+static size_t s_sse_len  = 0;
+static bool   s_sse_drop = false;   /*!< 当前行太长，丢弃到下一个换行 */
+
+/**
+ * @brief  把一段新收到的数据按行切分，逐行回调
+ */
+static void app_http_feed_lines(const char *data, size_t len, app_http_resp_t *resp)
+{
+    for (size_t i = 0; i < len; i++) {
+        const char c = data[i];
+
+        if (c == '\n') {
+            if (!s_sse_drop) {
+                size_t n = s_sse_len;
+                if (n > 0 && s_sse_line[n - 1] == '\r') {
+                    n--;                    /* 去掉 CRLF 里的 \r */
+                }
+                s_sse_line[n] = '\0';
+                if (resp->line_cb != NULL) {
+                    resp->line_cb(s_sse_line, resp->line_ctx);
+                }
+            }
+            s_sse_len  = 0;
+            s_sse_drop = false;
+        } else if (s_sse_drop) {
+            /* 丢弃这一行的剩余部分 */
+        } else if (s_sse_len + 1 < sizeof(s_sse_line)) {
+            s_sse_line[s_sse_len++] = c;
+        } else {
+            ESP_LOGW(TAG, "SSE 单行超过 %u 字节，整行丢弃", (unsigned)sizeof(s_sse_line));
+            s_sse_drop = true;
+        }
+    }
+}
 
 /** 单次 dump 最多完整打印多少字节（超出就只打头尾） */
 #define APP_HTTP_DUMP_MAX   4096
@@ -27,9 +71,22 @@ void app_http_resp_init(app_http_resp_t *resp, char *buf, size_t cap)
     resp->cap      = cap;
     resp->len      = 0;
     resp->overflow = false;
+    resp->line_cb  = NULL;
+    resp->line_ctx = NULL;
     if (buf != NULL && cap > 0) {
         buf[0] = '\0';
     }
+}
+
+void app_http_set_line_cb(app_http_resp_t *resp, app_http_line_cb_t cb, void *ctx)
+{
+    if (resp == NULL) {
+        return;
+    }
+    resp->line_cb  = cb;
+    resp->line_ctx = ctx;
+    s_sse_len      = 0;
+    s_sse_drop     = false;
 }
 
 esp_err_t app_http_event_handler(esp_http_client_event_t *evt)
@@ -40,7 +97,17 @@ esp_err_t app_http_event_handler(esp_http_client_event_t *evt)
 
     if (evt->event_id == HTTP_EVENT_ON_DATA) {
         app_http_resp_t *resp = (app_http_resp_t *)evt->user_data;
-        if (resp != NULL && resp->buf != NULL && evt->data != NULL && evt->data_len > 0) {
+        if (resp == NULL || evt->data == NULL || evt->data_len <= 0) {
+            return ESP_OK;
+        }
+
+        /* 流式模式：逐行回调（SSE 用）。仍继续把原始响应攒进 buf，
+         * 这样服务端返回非 200（错误 JSON 不是 SSE 格式）时还能解析出错误信息 */
+        if (resp->line_cb != NULL) {
+            app_http_feed_lines((const char *)evt->data, (size_t)evt->data_len, resp);
+        }
+
+        if (resp->buf != NULL) {
             size_t room = (resp->cap > resp->len + 1) ? (resp->cap - 1 - resp->len) : 0;
             size_t n    = ((size_t)evt->data_len <= room) ? (size_t)evt->data_len : room;
 
