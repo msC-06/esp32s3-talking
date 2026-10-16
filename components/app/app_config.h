@@ -312,6 +312,8 @@
 #define APP_CHAT_UI_TICK_MS         30
 /** 顶部状态栏高度 */
 #define APP_CHAT_TOPBAR_H           26
+/** 左上角 WiFi 文字的最大宽度（超了用省略号，别挤到右边的状态字） */
+#define APP_CHAT_WIFI_TEXT_MAX_W    140
 /** 底部状态行高度 */
 #define APP_CHAT_STATUSBAR_H        22
 /** 界面配色（RGB888，内部转 RGB565） */
@@ -322,7 +324,8 @@
 #define APP_COLOR_AI_BUBBLE         0x3A3A3A    /* AI 气泡（浅灰） */
 #define APP_COLOR_ERROR             0xFF5252    /* 错误文字 */
 #define APP_COLOR_OK                0x66BB6A    /* 正常/已连接 */
-#define APP_COLOR_WARN              0xFFD54F    /* 提示文字 */
+#define APP_COLOR_WARN              0xFFD54F    /* 提示文字 / 太阳图标 */
+#define APP_COLOR_PANEL             0x1E2A38    /* 弹窗面板底色 */
 
 /* ============================================================
  *  10. 系统时间（SNTP 对时，app_time.c）
@@ -370,5 +373,113 @@
 
 /** system 提示词缓冲大小（原文 + 时间那句话 + 结束符） */
 #define APP_LLM_SYSTEM_PROMPT_MAX   512
+
+/* ============================================================
+ *  11. 背光与设置持久化（app_settings.c + 界面上的太阳图标弹窗）
+ * ============================================================ */
+
+/** 默认背光亮度（%）：读不到设置文件、或 TF 卡没插时用它 */
+#define APP_LCD_BRIGHTNESS_DEFAULT  50
+
+/**
+ * 滑条能调到的**实际**最小亮度（%）。
+ *
+ * 为什么默认不是 0：滑条可以拖到 0，但 0% 就是全黑。如果把这个值存进 TF 卡，
+ * 下次开机屏幕就是黑的，用户既看不到太阳图标也点不到【确认】——机器等于锁死。
+ * 所以默认下限 5%（很暗但看得清）。真要“一键关屏”就把它改成 0，
+ * 但黑屏后只能靠串口或拔卡删 /sd/chat_settings.txt 恢复。
+ */
+#define APP_LCD_BRIGHTNESS_MIN      5
+
+/** 设置文件路径（TF 卡 FATFS，挂载点 /sd 见 my_drivers/sdcard） */
+#define APP_SETTINGS_PATH           "/sd/chat_settings.txt"
+
+/** 文件头标识：读文件时先认这行，避免误读同名的别的文件 */
+#define APP_SETTINGS_MAGIC          "ESP32TALK_CFG"
+
+/**
+ * TF 卡不可用时，把设置写进**内部 NVS**（flash 上的 nvs 分区，24KB）。
+ *
+ * 为什么要它：不是每张卡都好用 —— 实测遇到过“数据区已经损坏”的卡：
+ *   目录项/长度都写得进去，但数据区写入被静默丢弃（裸扇区测试全 FAIL，
+ *   连电脑写进去的文件读回来也是全 0）。这种卡上根本存不住东西。
+ * 打开后：**两边都写**（TF 卡 + NVS 镜像），读的时候取“序号更大的那一份”，
+ *   所以卡坏了照样能记住设置；换回好卡也能自动用上。
+ */
+#define APP_SETTINGS_NVS_ENABLE     1
+/** NVS 命名空间与键名 */
+#define APP_SETTINGS_NVS_NAMESPACE  "chatset"
+#define APP_SETTINGS_NVS_KEY_VALUE  "backlight"
+#define APP_SETTINGS_NVS_KEY_SEQ    "seq"
+
+/* ============================================================
+ *  12. WiFi 状态显示（左上角精简版：只显示“连没连”和“信号档位”）
+ * ============================================================ */
+
+/**
+ * 信号强度分档（dBm，数值越大越好）。
+ *   >= APP_WIFI_RSSI_STRONG -> 「WiFi 强」
+ *   >= APP_WIFI_RSSI_MEDIUM -> 「WiFi 中」
+ *   更低                     -> 「WiFi 弱」
+ * 经验值：-60 dBm 以上很稳，-75 以下开始丢包。
+ */
+#define APP_WIFI_RSSI_STRONG        (-60)
+#define APP_WIFI_RSSI_MEDIUM        (-75)
+
+/** WiFi 状态刷新周期（毫秒）：2~3 秒刷一次足够，别高频刷屏占 CPU */
+#define APP_WIFI_STATUS_REFRESH_MS  2500
+
+/**
+ * app 层手动补连的最小间隔（毫秒）。
+ * bsp_wifi 自己的重连任务会每 3 秒试一次、试 3 次就放弃；
+ * 超过这个时间还没连上，app 层才会去“扫一遍附近的已知网络并尝试连接”，
+ * 避免两边同时 esp_wifi_connect() 互相打架（见 app_wifi.c 注释）。
+ *
+ * @note  现在这条路径不只是重连“编译期那个 SSID”，而是把
+ *        app_config_secret.h 里的 SSID + NVS 里记过的网络都当成候选
+ *        （换个地方、换个热点照样能自己连上）。
+ */
+#define APP_WIFI_MANUAL_RECONNECT_MS APP_WIFI_KNOWN_SCAN_INTERVAL_MS
+
+/* ============================================================
+ *  13. WiFi 扫描 / 已保存网络（app_wifi_store + app_wifi_ui）
+ *
+ *  需求：
+ *    1. 顶栏的 WiFi 文字变成一个按钮，点开能看到附近的 WiFi；
+ *       点某个 WiFi 名弹出小键盘输入密码，连接成功后**账号密码存进 NVS**；
+ *    2. 没连上的时候定期扫描附近、发现“记过的”网络就自动连接；
+ *    3. 最多记 10 个，存满时**覆盖最久没用过的那个**。
+ * ============================================================ */
+
+/** 最多记住多少个连过的 WiFi（存满后覆盖“最久没用过”的那个） */
+#define APP_WIFI_STORE_MAX              10
+
+/** NVS 命名空间（NVS 名字最长 15 个字符） */
+#define APP_WIFI_STORE_NVS_NAMESPACE    "wifistore"
+
+/** 扫描结果最多缓存多少条（界面列表用；去重后按信号从强到弱排序） */
+#define APP_WIFI_SCAN_LIST_MAX          20
+
+/** WiFi 请求队列长度（界面 -> WiFi 任务：扫描 / 连接） */
+#define APP_WIFI_REQ_QUEUE_LEN          3
+
+/**
+ * 未连接时，每隔多久扫一次附近的 AP 并尝试连接“记录过的”网络（毫秒）。
+ * 底层的自动重连只认最后一次连接的那个 AP，换个地方（或换热点）就没用了，
+ * 所以要靠这条“扫一遍已知网络”的兜底路径。
+ */
+#define APP_WIFI_KNOWN_SCAN_INTERVAL_MS 30000
+
+/** 一轮自动连接最多试几个候选 AP（避免一个一个试太久、把用户自己的操作挤掉） */
+#define APP_WIFI_TRY_MAX                3
+
+/* ---------- WiFi 界面的尺寸/节奏（app_wifi_ui.c） ---------- */
+
+/** 列表里每一行的高度（像素） */
+#define APP_WIFI_LIST_ROW_H             30
+/** 弹窗轮询周期（毫秒）：看扫描/连接有没有结果 */
+#define APP_WIFI_UI_TICK_MS             150
+/** 连接成功后隔多久自动关掉弹窗（毫秒） */
+#define APP_WIFI_UI_CLOSE_DELAY_MS      1500
 
 #endif /* __APP_CONFIG_H */

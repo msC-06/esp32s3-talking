@@ -24,6 +24,29 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
 
+# ---------------------------------------------------------------------------
+# 【必须关掉】不要把 FatFS 的扇区缓冲放到 PSRAM 里！
+#
+# 现象（踩了很久的坑）：往 TF 卡写文件时目录项长度是对的（例如 157 字节），
+# 但用电脑打开文件**是空的 / 全 0**，设备自己回读也读不到内容。
+#
+# 原因：SDMMC 驱动在 ESP32-S3 上不做 cache 回写。
+#   components/esp_driver_sdmmc/src/sdmmc_transaction.c：
+#       #if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+#           esp_cache_msync(buf, len, ...C2M);   // 写卡前把 CPU cache 刷回内存
+#       #endif
+#   而 SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE **只有 ESP32-P4 定义**（见 soc_caps.h），
+#   S3 上这段直接被编译掉。于是：
+#     - 缓冲在**内部 RAM**：S3 内部 RAM 不经 L1 cache，DMA 读到的一定是最新数据 ✅
+#     - 缓冲在**PSRAM**：CPU 写入还躺在 cache 里，SDMMC 的 DMA 直接读 PSRAM，
+#       读到的是旧内容（看起来就是整片 0）❌
+#   CONFIG_FATFS_ALLOC_PREFER_EXTRAM 默认是 y（为了省内部 RAM），
+#   在「S3 + TF 卡」这个组合下就会写出“有长度、没内容”的文件。
+#
+# 关掉之后 FatFS 的窗口/文件缓冲改用内部 RAM，多占 1~2KB 而已。
+CONFIG_FATFS_PER_FILE_CACHE=y
+# CONFIG_FATFS_ALLOC_PREFER_EXTRAM is not set
+
 # ===========================================================================
 # 对话掌机（按键录音 -> 百度 ASR -> DeepSeek LLM -> LCD 显示）需要的配置
 # ===========================================================================

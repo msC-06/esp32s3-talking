@@ -14,6 +14,7 @@
 #include "app_net.h"
 #include "app_chat_ui.h"
 #include "app_mem.h"
+#include "app_settings.h"
 #include "app_time.h"
 
 #include "my_drivers/lcd.h"
@@ -63,12 +64,30 @@ esp_err_t app_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* ---------- 0. 内存监控：先注册钩子，第一行日志就是“还没分配大缓冲”的基线 ---------- */
+    /* ---------- 0. 用户设置（背光等）----------
+     * 尽量早：lcd_init() 里背光是 100%，这里读回用户上次保存的亮度并立刻应用，
+     * 免得开机先刺眼地亮一下再变暗。TF 卡没插就用默认 50%，不影响后面流程。 */
+    if (app_settings_init() != ESP_OK) {
+        ESP_LOGW(TAG, "用户设置初始化异常，继续启动");
+    }
+
+    /* ---------- 0.5 内存监控：先注册钩子，第一行日志就是“还没分配大缓冲”的基线 ---------- */
     app_mem_monitor_init();
 
     /* ---------- 1. 跨任务队列 ---------- */
     ESP_RETURN_ON_ERROR(app_bus_init(), TAG, "队列初始化失败");
 
+    /* ---------- 1.5 WiFi 提前初始化 ----------
+     * 顶栏那个 WiFi 文字按钮随时可能被点开，它要靠 app_wifi 里的
+     * “请求队列 + 互斥锁 + NVS 名单”才能发扫描/连接请求，所以这些必须在**界面建好之前**
+     * 就准备好（界面一加载，用户就能点）；射频（net_init）也一并在这里初始化，
+     * app_wifi_task 里再调一次是幂等的。顺便把 NVS 里记着的网络读进内存，
+     * 开机日志里就能看到“记着几个 WiFi”。 */
+    esp_err_t err = app_wifi_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi 初始化失败: %s（界面上的 WiFi 按钮仍可打开，但扫不到东西）",
+                 esp_err_to_name(err));
+    }
     /* ---------- 2. 中文字库（HZK16，GB2312 点阵，从 fontbin 分区按需读取） ---------- */
     if (hzk16_init() != ESP_OK) {
         ESP_LOGE(TAG, "中文字库初始化失败，中文会显示成占位框");
@@ -77,7 +96,7 @@ esp_err_t app_start(void)
     const lv_font_t *cn_font = hzk16_get_lv_font();
 
     /* ---------- 3. 聊天界面（新建 screen 并加载） ---------- */
-    esp_err_t err = app_chat_ui_init(cn_font);
+    err = app_chat_ui_init(cn_font);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "聊天界面创建失败: %s", esp_err_to_name(err));
         return err;

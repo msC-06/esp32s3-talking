@@ -29,6 +29,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>       /* struct tm —— 必须在这里引：
+                         * 否则 app_time_now(struct tm *) 的参数会被当成
+                         * “在本头文件里新声明的不完整类型”，
+                         * 包含本头的其它 .c 编译时会告警，而且两边类型其实不一致。 */
 
 #include "esp_err.h"
 

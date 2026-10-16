@@ -35,7 +35,9 @@
 #include "app_chat_ui.h"
 #include "app_config.h"
 #include "app_gb2312.h"
+#include "app_settings.h"           /* 背光设置：太阳图标弹窗用它读写/持久化 */
 #include "app_time.h"               /* 待机时在状态行后面挂一个 HH:MM */
+#include "app_wifi_ui.h"            /* WiFi 文字按钮点开“附近 WiFi”弹窗 */
 
 #include "my_drivers/lcd.h"
 
@@ -57,9 +59,15 @@ static const lv_font_t *s_font        = NULL;
 static lv_obj_t        *s_scr         = NULL;   /*!< 本模块新建的 screen */
 static lv_obj_t        *s_msg_area    = NULL;   /*!< 消息区（滚动容器） */
 static lv_obj_t        *s_status_lbl  = NULL;   /*!< 底部状态行 */
-static lv_obj_t        *s_wifi_lbl    = NULL;   /*!< 顶部 WiFi 状态 */
+static lv_obj_t        *s_wifi_btn    = NULL;   /*!< 顶部 WiFi 文字按钮（点开附近 WiFi 列表） */
+static lv_obj_t        *s_wifi_lbl    = NULL;   /*!< 顶部 WiFi 状态文字（WiFi未连接 / WiFi 强|中|弱） */
 static lv_obj_t        *s_rec_flag    = NULL;   /*!< 顶部录音/处理指示 */
 static lv_timer_t      *s_timer       = NULL;
+
+/** 背光设置弹窗（NULL = 没打开）；里面的控件在关闭时一起删掉 */
+static lv_obj_t        *s_bk_modal    = NULL;
+static lv_obj_t        *s_bk_slider   = NULL;
+static lv_obj_t        *s_bk_value_lbl = NULL;
 
 /** 当前显示的气泡行（用于超量时删除最老的） */
 static lv_obj_t        *s_rows[APP_CHAT_MAX_BUBBLES];
@@ -554,6 +562,287 @@ static void ui_timer_cb(lv_timer_t *timer)
     }
 }
 
+/* ============================ 内部函数：背光设置弹窗 ============================ */
+
+/**
+ * @brief  更新弹窗里的“亮度 xx%”文字
+ */
+static void ui_bk_update_value_label(int value)
+{
+    if (s_bk_value_lbl == NULL) {
+        return;
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "亮度 %d%%", value);
+    lv_label_set_text(s_bk_value_lbl, buf);
+}
+
+/**
+ * @brief  关闭弹窗（只删遮罩，里面的控件都是它的子对象，会一起删掉）
+ */
+static void ui_bk_close(void)
+{
+    if (s_bk_modal != NULL) {
+        lv_obj_delete(s_bk_modal);
+        s_bk_modal     = NULL;
+        s_bk_slider    = NULL;
+        s_bk_value_lbl = NULL;
+        ESP_LOGI(TAG, "背光设置弹窗已关闭（当前 %d%%）", app_settings_get_backlight());
+    }
+    /* 弹窗都关掉了才恢复录音按键（万一 WiFi 弹窗还开着就别清这个标记） */
+    if (!app_wifi_ui_is_open()) {
+        app_bus_set_ui_modal(false);
+    }
+}
+
+/**
+ * @brief  滑条回调：**拖动时实时**改亮度（但不写卡）
+ *
+ * @note   写卡只在【确认】时做一次：
+ *         滑条每动一格就写一次 TF 卡既慢又费卡，而且没必要。
+ */
+static void ui_bk_slider_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    int       value  = (int)lv_slider_get_value(slider);
+
+    ui_bk_update_value_label(value);
+    app_settings_set_backlight(value, false);       /* persist = false */
+}
+
+/**
+ * @brief  确认按钮：保存亮度到 TF 卡并关闭弹窗
+ */
+static void ui_bk_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+
+    int value = (s_bk_slider != NULL) ? (int)lv_slider_get_value(s_bk_slider)
+                                      : app_settings_get_backlight();
+
+    esp_err_t err = app_settings_set_backlight(value, true);
+    if (err != ESP_OK) {
+        /* TF 卡不可用：亮度已经生效，只是重启后会回到默认值——如实告诉用户 */
+        app_bus_post_chatf(CHAT_MSG_ERROR, "亮度已生效，但保存失败(%s)",
+                           esp_err_to_name(err));
+    }
+    ui_bk_close();
+}
+
+/**
+ * @brief  打开背光设置弹窗
+ *
+ * @note   弹窗是 s_scr 的子对象（盖在最上层）+ 半透明遮罩，
+ *         遮罩自身可点击，用来吃掉对下面控件的误触；
+ *         **只有【确认】会关闭它**，避免用户以为“点外面=取消”而实际亮度已经改了。
+ */
+static void ui_bk_open(void)
+{
+    if (s_bk_modal != NULL || s_scr == NULL) {
+        return;                         /* 已经打开 / 界面还没建好 */
+    }
+
+    /* ---------- 1. 遮罩 ---------- */
+    lv_obj_t *mask = lv_obj_create(s_scr);
+    lv_obj_set_size(mask, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(mask);
+    lv_obj_set_style_bg_color(mask, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(mask, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_border_width(mask, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(mask, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(mask, 0, LV_PART_MAIN);
+    lv_obj_set_scrollable(mask, false);
+    lv_obj_set_clickable(mask, true);       /* 遮罩自己吃掉点击，别穿到下面的控件 */
+
+    /* ---------- 2. 面板 ---------- */
+    lv_obj_t *panel = lv_obj_create(mask);
+    lv_obj_set_size(panel, 280, 150);
+    lv_obj_center(panel);
+    lv_obj_set_style_radius(panel, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(APP_COLOR_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(panel, lv_color_hex(APP_COLOR_WARN), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(panel, 10, LV_PART_MAIN);
+    lv_obj_set_scrollable(panel, false);
+
+    /* ---------- 3. 标题 ---------- */
+    lv_obj_t *title = lv_label_create(panel);
+    lv_label_set_text(title, "屏幕背光设置");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(title, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(title, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    /* ---------- 4. 当前亮度 ---------- */
+    s_bk_value_lbl = lv_label_create(panel);
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(s_bk_value_lbl, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(s_bk_value_lbl, lv_color_hex(APP_COLOR_WARN), LV_PART_MAIN);
+    lv_obj_align(s_bk_value_lbl, LV_ALIGN_TOP_MID, 0, 26);
+
+    /* ---------- 5. 亮度滑条（0~100，拖动实时生效） ---------- */
+    int current = app_settings_get_backlight();
+
+    s_bk_slider = lv_slider_create(panel);
+    lv_obj_set_width(s_bk_slider, 240);
+    lv_obj_set_height(s_bk_slider, 20);
+    lv_slider_set_range(s_bk_slider, 0, 100);
+    lv_slider_set_value(s_bk_slider, current, LV_ANIM_OFF);
+    lv_obj_align(s_bk_slider, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_add_event_cb(s_bk_slider, ui_bk_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    ui_bk_update_value_label(current);
+
+    /* ---------- 6. 确认按钮 ---------- */
+    lv_obj_t *btn = lv_button_create(panel);
+    lv_obj_set_size(btn, 100, 32);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_radius(btn, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(APP_COLOR_USER_BUBBLE), LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, ui_bk_confirm_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *btn_lbl = lv_label_create(btn);
+    lv_label_set_text(btn_lbl, "确认");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(btn_lbl, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(btn_lbl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_center(btn_lbl);
+
+    s_bk_modal = mask;
+
+    /* 弹窗期间按住录音键不生效（用户正在拖滑条，别冒出“录音中...”） */
+    app_bus_set_ui_modal(true);
+
+    ESP_LOGI(TAG, "打开背光设置弹窗（当前 %d%%，范围 0~100，实际下限 %d%%）",
+             current, APP_LCD_BRIGHTNESS_MIN);
+}
+
+/**
+ * @brief  太阳图标被点击
+ */
+static void ui_sun_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_bk_open();
+}
+
+/**
+ * @brief  创建“太阳”小图标（纯 LVGL 基本图形画的，不依赖图片资源）
+ *
+ * @note   画法：18×18 的可点击容器 + 中间 10×10 实心黄圆 + 上下左右 4 根小光线。
+ *         子对象都清掉 CLICKABLE，这样点在圆或光线上也会冒泡给容器，
+ *         不会出现“点中间没反应、点边上才有”的怪现象。
+ * @note   为什么不用字体图标：中文字库是 GB2312 点阵，里面没有 ☀ 这种符号；
+ *         而 LVGL 内置符号字体在这块板上也没挂到中文 label 上，画基本图形最稳。
+ */
+static lv_obj_t *ui_create_sun_button(lv_obj_t *parent)
+{
+    static const struct {
+        int      w;
+        int      h;
+        lv_align_t align;
+    } rays[4] = {
+        { 2, 4, LV_ALIGN_TOP_MID },
+        { 2, 4, LV_ALIGN_BOTTOM_MID },
+        { 4, 2, LV_ALIGN_LEFT_MID },
+        { 4, 2, LV_ALIGN_RIGHT_MID },
+    };
+    const lv_color_t sun = lv_color_hex(APP_COLOR_WARN);
+
+    lv_obj_t *btn = lv_obj_create(parent);
+    lv_obj_set_size(btn, 18, 18);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_scrollable(btn, false);
+    lv_obj_set_clickable(btn, true);
+    lv_obj_add_event_cb(btn, ui_sun_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 中间那个圆 */
+    lv_obj_t *core = lv_obj_create(btn);
+    lv_obj_set_size(core, 10, 10);
+    lv_obj_set_style_radius(core, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(core, sun, LV_PART_MAIN);
+    lv_obj_set_style_border_width(core, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(core, 0, LV_PART_MAIN);
+    lv_obj_set_scrollable(core, false);
+    lv_obj_set_clickable(core, false);      /* 点击冒泡给外层容器 */
+    lv_obj_center(core);
+
+    /* 四根光线 */
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *ray = lv_obj_create(btn);
+        lv_obj_set_size(ray, rays[i].w, rays[i].h);
+        lv_obj_set_style_bg_color(ray, sun, LV_PART_MAIN);
+        lv_obj_set_style_border_width(ray, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(ray, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(ray, 0, LV_PART_MAIN);
+        lv_obj_set_scrollable(ray, false);
+        lv_obj_set_clickable(ray, false);   /* 同样让点击冒泡给容器 */
+        lv_obj_align(ray, rays[i].align, 0, 0);
+    }
+
+    return btn;
+}
+
+/* ============================ 内部函数：WiFi 文字按钮 ============================ */
+
+/**
+ * @brief  WiFi 文字被点击：弹出“附近 WiFi”列表
+ *
+ * @note   这个回调在 LVGL 任务里执行；扫描/连接本身由 app_wifi_task 做，
+ *         所以这里不会卡界面（详见 app_wifi_ui.c 文件头）。
+ */
+static void ui_wifi_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "点开了 WiFi 状态文字，打开附近 WiFi 列表");
+    app_wifi_ui_open();
+}
+
+/**
+ * @brief  创建左上角的 WiFi 文字按钮
+ *
+ * @param  parent 顶栏里的横向容器
+ * @return 按钮对象（文字 label 由外部继续维护，句柄存在 s_wifi_lbl）
+ *
+ * @note   需求：原来这里是个**纯文本 label**，现在要能点 —— 做法是把 label 套进一个
+ *         背景全透明的按钮里（不画边框/底色，视觉上还是那行字），
+ *         按下时给一点半透明底色做“按得动”的反馈。
+ */
+static lv_obj_t *ui_create_wifi_button(lv_obj_t *parent)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(btn, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(btn, 2, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_scrollable(btn, false);
+    /* 按下时给个浅色底：这块屏没有触感反馈，全靠视觉提示 */
+    lv_obj_set_style_bg_color(btn, lv_color_hex(APP_COLOR_WARN), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_30, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(btn, ui_wifi_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+    s_wifi_lbl = lv_label_create(btn);
+    lv_label_set_text(s_wifi_lbl, "WiFi未连接");
+    if (s_font) {
+        lv_obj_set_style_text_font(s_wifi_lbl, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(s_wifi_lbl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    /* 只留“WiFi + 一档信号”这么长；真要变长了就省略号，绝不挤到右边的状态字 */
+    lv_obj_set_style_max_width(s_wifi_lbl, APP_CHAT_WIFI_TEXT_MAX_W, LV_PART_MAIN);
+    lv_label_set_long_mode(s_wifi_lbl, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_center(s_wifi_lbl);
+
+    return btn;
+}
+
 /* ============================ 对外接口 ============================ */
 
 esp_err_t app_chat_ui_init(const lv_font_t *cn_font)
@@ -584,15 +873,24 @@ esp_err_t app_chat_ui_init(const lv_font_t *cn_font)
     lv_obj_align(topbar, LV_ALIGN_TOP_MID, 0, 0);
     ui_obj_base(topbar, lv_color_hex(APP_COLOR_TOPBAR));
 
-    s_wifi_lbl = lv_label_create(topbar);
-    lv_label_set_text(s_wifi_lbl, "WiFi: 连接中...");
-    if (s_font) {
-        lv_obj_set_style_text_font(s_wifi_lbl, s_font, LV_PART_MAIN);
-    }
-    lv_obj_set_style_text_color(s_wifi_lbl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
-    lv_obj_set_style_max_width(s_wifi_lbl, BSP_LCD_H_RES - 80, LV_PART_MAIN);
-    lv_label_set_long_mode(s_wifi_lbl, LV_LABEL_LONG_MODE_DOTS);
-    lv_obj_align(s_wifi_lbl, LV_ALIGN_LEFT_MID, 6, 0);
+    /* 左上角：WiFi 文字按钮 + 太阳图标（背光设置入口）。
+     * 用一个横向 flex 容器把两者排在一起，这样 WiFi 文字变长（WiFi未连接 ↔ WiFi 强）
+     * 时太阳图标会自动跟着移动，不需要手算坐标。
+     * WiFi 那一段是个**按钮**：点一下弹出附近 WiFi 列表（见 app_wifi_ui.c）。 */
+    lv_obj_t *left_box = lv_obj_create(topbar);
+    lv_obj_set_size(left_box, LV_SIZE_CONTENT, LV_PCT(100));
+    lv_obj_set_flex_flow(left_box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(left_box, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    ui_obj_base(left_box, lv_color_hex(APP_COLOR_TOPBAR));      /* 与顶栏同色 = 视觉透明 */
+    lv_obj_set_style_pad_left(left_box, 6, LV_PART_MAIN);       /* 注意：要在 base 之后再设 */
+    lv_obj_set_style_pad_column(left_box, 6, LV_PART_MAIN);     /* 文字与图标间距 */
+    lv_obj_align(left_box, LV_ALIGN_LEFT_MID, 0, 0);
+
+    s_wifi_btn = ui_create_wifi_button(left_box);
+    (void)s_wifi_btn;
+
+    ui_create_sun_button(left_box);
 
     s_rec_flag = lv_label_create(topbar);
     lv_label_set_text(s_rec_flag, "待机");

@@ -34,6 +34,9 @@ static volatile app_state_t s_state = APP_STATE_IDLE;
 /** 界面是否正在逐字显示 AI 回复（写者：LVGL 定时器；读者：状态机） */
 static volatile bool s_ui_typing = false;
 
+/** 界面上是否有模态弹窗（写者：LVGL 任务；读者：状态机） */
+static volatile bool s_ui_modal = false;
+
 /* ============================ 发送暂存区 ============================ */
 /*
  * 为什么不用局部变量发消息：
@@ -137,6 +140,7 @@ esp_err_t app_bus_init(void)
 
     s_state     = APP_STATE_IDLE;
     s_ui_typing = false;
+    s_ui_modal  = false;
     ESP_LOGI(TAG, "队列就绪：key=%d audio=%d pcm=%d asr=%d llm=%d chat=%d ui=%d",
              APP_KEY_QUEUE_LEN, APP_AUDIO_QUEUE_LEN, APP_PCM_QUEUE_LEN,
              APP_ASR_QUEUE_LEN, APP_LLM_QUEUE_LEN, APP_CHAT_QUEUE_LEN, APP_UI_QUEUE_LEN);
@@ -190,6 +194,21 @@ void app_bus_set_ui_typing(bool typing)
 bool app_bus_is_ui_typing(void)
 {
     return s_ui_typing;
+}
+
+/* ============================ 界面模态（弹窗） ============================ */
+
+void app_bus_set_ui_modal(bool open)
+{
+    if (s_ui_modal != open) {
+        ESP_LOGI(TAG, "界面弹窗: %s", open ? "打开（录音键暂停响应）" : "关闭");
+    }
+    s_ui_modal = open;
+}
+
+bool app_bus_is_ui_modal(void)
+{
+    return s_ui_modal;
 }
 
 /* ============================ 投递接口 ============================ */

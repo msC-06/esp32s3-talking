@@ -38,6 +38,19 @@ extern "C" {
 /** 挂载点（用标准 C 库文件接口时带上这个前缀） */
 #define SDCARD_MOUNT_POINT      "/sd"
 
+/**
+ * SD 时钟上限（kHz）。默认 20MHz（SDMMC_HOST_DEFAULT 的值）。
+ *
+ * 为什么要做成宏：实测遇到过“读卡完全正常、写入却被静默丢弃”的卡/板组合。
+ * 读是卡驱动数据线、写是主机驱动数据线，写还要求卡在编程瞬间有足够电流，
+ * 所以时钟太快 / 信号余量不足时，常见表现就是“写返回成功、数据没进卡”。
+ * 把这里改小（例如 5000、1000 甚至 400）往往能救回来 ——
+ * 开机时 sdcard_selftest() 会做一次“写入速度阶梯探测”，直接把能写进去的那一档报出来。
+ */
+#ifndef SDCARD_MAX_FREQ_KHZ
+#define SDCARD_MAX_FREQ_KHZ     20000
+#endif
+
 /** 打开文件数的上限 */
 #define SDCARD_MAX_FILES        5
 
@@ -83,6 +96,41 @@ const char *sdcard_get_mount_point(void);
  * @return ESP_OK 成功；ESP_ERR_INVALID_STATE 未挂载；ESP_ERR_INVALID_ARG 参数为空
  */
 esp_err_t sdcard_get_info(sdcard_info_t *info);
+
+/**
+ * @brief  底层写入自检：绕过文件系统，直接在卡上挑几个扇区做「写→回读→比对」
+ *
+ * @param  out      输出一段人类可读的检查结果（失败原因也写在这里）
+ * @param  out_size 缓冲大小（建议 >= 384）
+ * @return ESP_OK 自检执行完成（结果在 out 里）；其它表示压根没跑起来（未挂载/内存不足）
+ *
+ * @note   为什么需要它：文件系统层面出现过「目录项长度对、数据区全是 0」的现象
+ *         （写卡返回成功但数据没落盘），必须把问题定位到“卡本身 / 驱动程序 /
+ *         用的是不是内部 RAM 缓冲”哪一层。本函数对每个扇区：
+ *           1. 先读回原内容（测完会原样写回，不动用户数据）；
+ *           2. 用 **内部 RAM** 缓冲写一个特征串，回读比对；
+ *           3. 用 **PSRAM** 缓冲写另一个特征串，回读比对（PSRAM 缓冲在
+ *              ESP32-S3 上可能因为 DMA 不做 cache 回写而丢数据，正好对照）。
+ *         测试位置取容量的 10% / 50% / 90% / 最后一个扇区 —— 卡几乎是空的，
+ *         这些位置都在空闲簇里，写完还会还原，不破坏文件系统。
+ */
+esp_err_t sdcard_selftest(char *out, size_t out_size);
+
+/**
+ * @brief  写入速度阶梯探测：把 SD 时钟从 20MHz 一路降到 400kHz，看哪一档能真正写进卡
+ *
+ * @param  out      输出结果文本（每档一行结果）
+ * @param  out_size 缓冲大小（建议 >= 320）
+ * @return ESP_OK 探测完成（结果在 out 里）；其它表示没跑起来
+ *
+ * @note   什么时候需要它：读卡正常、写入却被静默丢弃。
+ *         写 flash 需要更大的瞬时电流、对信号完整性也更敏感，
+ *         所以“降频能不能救”是判断“卡坏 vs 时序/供电余量不足”的关键实验。
+ *         探测过程中会把时钟停在**第一个能写成功的档位**上（本次运行有效），
+ *         想让每次开机都用这个频率，就把 sdcard.h 里的 SDCARD_MAX_FREQ_KHZ 改掉。
+ *         探测只写数据区的空闲扇区并还原原内容，不动文件系统。
+ */
+esp_err_t sdcard_write_probe(char *out, size_t out_size);
 
 #ifdef __cplusplus
 }

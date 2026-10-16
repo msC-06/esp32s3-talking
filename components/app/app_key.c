@@ -245,6 +245,12 @@ void app_key_task(void *arg)
 
             switch (key_ev) {
             case APP_KEY_EVENT_PRESS:
+                if (app_bus_is_ui_modal()) {
+                    /* 界面上正开着弹窗（背光设置 / WiFi 列表 / 输密码），
+                     * 这时按录音键一定是误触：屏幕上正输密码呢，别冒出“录音中...” */
+                    ESP_LOGW(TAG, "界面弹窗打开中，忽略这次按下");
+                    break;
+                }
                 if (state != APP_STATE_IDLE) {
                     /* 上一轮还没收尾（含“界面正在逐字显示回复”），这次按下不生效 */
                     ESP_LOGW(TAG, "当前状态不允许录音（%s），忽略这次按下",

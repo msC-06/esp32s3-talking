@@ -38,6 +38,9 @@ endif()
 #     app_http.c                    HTTP 响应体累积读取 + JSON 解析兜底
 #     app_web_search.c              Tavily 联网搜索（DeepSeek Function Calling 工具）
 #     app_time.c                    SNTP 对时 + 时间格式化（喂给界面与大模型）
+#     app_settings.c                TF 卡上的用户设置（背光亮度持久化）
+#     app_wifi_store.c              连过的 WiFi 名单（SSID+密码）存内部 NVS，最多 10 个
+#     app_wifi_ui.c                 附近 WiFi 列表弹窗 + 小键盘输密码弹窗
 #     app_mem.c                     空闲任务里的内存监控（堆 / PSRAM / LVGL 池）
 #   小游戏（保留）
 #     game_launcher/                游戏管理器 + 主页 + 存档服务
@@ -59,6 +62,9 @@ idf_component_register(
         "app_http.c"
         "app_web_search.c"
         "app_time.c"
+        "app_settings.c"
+        "app_wifi_store.c"
+        "app_wifi_ui.c"
         "app_mem.c"
         "game_launcher/game_manager.c"
         "game_launcher/launcher_ui.c"
