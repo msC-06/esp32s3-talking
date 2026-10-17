@@ -96,14 +96,16 @@ void app_net_task(void *arg)
         }
         ESP_LOGI(TAG, "收到录音：%u 字节 / %u ms", (unsigned)msg.bytes, (unsigned)msg.duration_ms);
 
-        /* 2. 没联网先等一下（网络掉线后重连、或刚开机用户马上说话） */
+        /* 2. WiFi 未连接：**不尝试上传**（需求：未连接时不再尝试上传，
+         *    直到 WiFi 连上才恢复）。正常路径下按键侧（app_key）就已经拦住了，
+         *    这里兜住“录音途中掉线、松手后才走到这儿”的窗口。
+         *    注意：msg.pcm 指向录音器的静态 PSRAM 缓冲（下次录音会被覆盖），
+         *    不需要也不能在这里 free。 */
         if (!app_wifi_is_connected()) {
-            app_bus_post_chat(CHAT_MSG_STATUS, "等待 WiFi 连接...");
-            if (!app_wifi_wait_connected(NET_WAIT_WIFI_MS)) {
-                ESP_LOGE(TAG, "WiFi 未连接，放弃本次识别");
-                app_bus_post_asr(false, "WiFi 未连接");
-                continue;
-            }
+            ESP_LOGW(TAG, "WiFi 未连接，跳过本次上传（%u 字节录音直接丢弃）",
+                     (unsigned)msg.bytes);
+            app_bus_post_asr(false, "WiFi 未连接，请先连接 WiFi");
+            continue;
         }
 
         /* 3. 云端识别（百度 ASR） */

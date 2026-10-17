@@ -13,7 +13,10 @@
  *   2. **app_key_task**（Core 1，优先级 4）
  *      消费按键事件，驱动业务状态机：
  *        PRESS   -> 通知音频任务开始录音，状态 = RECORDING
+ *                   （**WiFi 未连接时不录音**：只投递 CHAT_MSG_WIFI_ALERT，
+ *                    界面收到后弹出「WiFi未连接」提示，直到连上才恢复）
  *        RELEASE -> 通知音频任务停止录音并上交 PCM，状态 = UPLOADING
+ *                   （松手时 WiFi 已断开 -> 丢弃本次录音，不尝试上传）
  *        TIMEOUT -> 同 RELEASE（但不丢弃数据）
  *      同时消费 ASR / LLM 结果队列与界面回报事件：
  *        ASR 失败 -> 报错回 IDLE；成功 -> 状态 = LLM_REQUEST

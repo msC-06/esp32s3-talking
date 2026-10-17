@@ -37,6 +37,7 @@
 #include "app_gb2312.h"
 #include "app_settings.h"           /* 背光设置：太阳图标弹窗用它读写/持久化 */
 #include "app_time.h"               /* 待机时在状态行后面挂一个 HH:MM */
+#include "app_wifi.h"               /* WiFi 连没连：决定“WiFi未连接”提示弹窗要不要自动收起 */
 #include "app_wifi_ui.h"            /* WiFi 文字按钮点开“附近 WiFi”弹窗 */
 
 #include "my_drivers/lcd.h"
@@ -68,6 +69,9 @@ static lv_timer_t      *s_timer       = NULL;
 static lv_obj_t        *s_bk_modal    = NULL;
 static lv_obj_t        *s_bk_slider   = NULL;
 static lv_obj_t        *s_bk_value_lbl = NULL;
+
+/** 「WiFi未连接」提示弹窗（NULL = 没打开）；控件在关闭时一起删掉 */
+static lv_obj_t        *s_wifi_alert_modal = NULL;
 
 /** 当前显示的气泡行（用于超量时删除最老的） */
 static lv_obj_t        *s_rows[APP_CHAT_MAX_BUBBLES];
@@ -460,6 +464,151 @@ static void ui_set_status(const char *text, bool is_error)
     s_error_until = is_error ? (lv_tick_get() + UI_ERROR_SHOW_MS) : 0;
 }
 
+/* ============================ 内部函数：「WiFi未连接」提示弹窗 ============================ */
+
+/**
+ * @brief  当前是否还有模态弹窗开着
+ *
+ * @note   关闭某个弹窗时用它决定要不要清“界面模态”标记：
+ *         只有**所有**弹窗都关了，录音键才恢复正常响应。
+ */
+static bool ui_modal_present(void)
+{
+    return (s_bk_modal != NULL) || (s_wifi_alert_modal != NULL) || app_wifi_ui_is_open();
+}
+
+/**
+ * @brief  关闭「WiFi未连接」提示弹窗（子控件随遮罩一起删掉）
+ */
+static void ui_wifi_alert_close(void)
+{
+    if (s_wifi_alert_modal == NULL) {
+        return;
+    }
+    lv_obj_delete(s_wifi_alert_modal);
+    s_wifi_alert_modal = NULL;
+
+    if (!ui_modal_present()) {          /* 别的弹窗都关着才恢复录音键 */
+        app_bus_set_ui_modal(false);
+    }
+    ESP_LOGI(TAG, "「WiFi未连接」提示弹窗已关闭");
+}
+
+/** 【知道了】：只关提示，不连 WiFi */
+static void ui_wifi_alert_dismiss_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_wifi_alert_close();
+}
+
+/** 【去连接】：收起提示，直接打开“附近 WiFi”列表，让用户马上选网 */
+static void ui_wifi_alert_go_connect_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "提示弹窗里点【去连接】，打开附近 WiFi 列表");
+    ui_wifi_alert_close();
+    app_wifi_ui_open();
+}
+
+/**
+ * @brief  打开「WiFi未连接」提示弹窗
+ *
+ * @note   触发场景见 app_key.c：WiFi 未连接时按下录音键，状态机**不录音**，
+ *         只投递 CHAT_MSG_WIFI_ALERT，UI 定时器收到后调用本函数。
+ *         弹窗期间会置“界面模态”标记，录音键继续无效；
+ *         WiFi 一连上，ui_timer_cb 里的检查会自动把它收起来并恢复录音。
+ */
+static void ui_wifi_alert_open(void)
+{
+    if (s_wifi_alert_modal != NULL || s_scr == NULL) {
+        return;                         /* 已经打开 / 界面还没建好 */
+    }
+
+    /* ---------- 1. 遮罩（吃掉下层点击，避免误触） ---------- */
+    lv_obj_t *mask = lv_obj_create(s_scr);
+    lv_obj_set_size(mask, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(mask);
+    lv_obj_set_style_bg_color(mask, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(mask, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_border_width(mask, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(mask, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(mask, 0, LV_PART_MAIN);
+    lv_obj_set_scrollable(mask, false);
+    lv_obj_set_clickable(mask, true);
+
+    /* ---------- 2. 面板 ---------- */
+    lv_obj_t *panel = lv_obj_create(mask);
+    lv_obj_set_size(panel, 270, 150);
+    lv_obj_center(panel);
+    lv_obj_set_style_radius(panel, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(APP_COLOR_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(panel, lv_color_hex(APP_COLOR_ERROR), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(panel, 10, LV_PART_MAIN);
+    lv_obj_set_scrollable(panel, false);
+
+    /* ---------- 3. 标题 + 两行说明 ---------- */
+    lv_obj_t *title = lv_label_create(panel);
+    lv_label_set_text(title, "WiFi未连接");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(title, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(title, lv_color_hex(APP_COLOR_ERROR), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *desc = lv_label_create(panel);
+    lv_label_set_text(desc, "请先连接 WiFi 再按住说话");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(desc, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(desc, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(desc, LV_ALIGN_TOP_MID, 0, 34);
+
+    lv_obj_t *desc2 = lv_label_create(panel);
+    lv_label_set_text(desc2, "录音与上传已暂停，连上后自动恢复");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(desc2, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(desc2, lv_color_hex(APP_COLOR_WARN), LV_PART_MAIN);
+    lv_obj_align(desc2, LV_ALIGN_TOP_MID, 0, 58);
+
+    /* ---------- 4. 按钮：去连接 / 知道了 ---------- */
+    lv_obj_t *btn_go = lv_button_create(panel);
+    lv_obj_set_size(btn_go, 110, 30);
+    lv_obj_align(btn_go, LV_ALIGN_BOTTOM_LEFT, 14, 0);
+    lv_obj_set_style_radius(btn_go, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn_go, lv_color_hex(APP_COLOR_USER_BUBBLE), LV_PART_MAIN);
+    lv_obj_add_event_cb(btn_go, ui_wifi_alert_go_connect_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *btn_go_lbl = lv_label_create(btn_go);
+    lv_label_set_text(btn_go_lbl, "去连接");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(btn_go_lbl, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(btn_go_lbl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_center(btn_go_lbl);
+
+    lv_obj_t *btn_ok = lv_button_create(panel);
+    lv_obj_set_size(btn_ok, 100, 30);
+    lv_obj_align(btn_ok, LV_ALIGN_BOTTOM_RIGHT, -14, 0);
+    lv_obj_set_style_radius(btn_ok, 6, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn_ok, lv_color_hex(APP_COLOR_USER_BUBBLE), LV_PART_MAIN);
+    lv_obj_add_event_cb(btn_ok, ui_wifi_alert_dismiss_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *btn_ok_lbl = lv_label_create(btn_ok);
+    lv_label_set_text(btn_ok_lbl, "知道了");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(btn_ok_lbl, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(btn_ok_lbl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_center(btn_ok_lbl);
+
+    s_wifi_alert_modal = mask;
+
+    /* 弹窗期间录音键无效；WiFi 连上或用户点按钮关掉后恢复 */
+    app_bus_set_ui_modal(true);
+
+    ESP_LOGI(TAG, "WiFi 未连接，弹出提示弹窗（录音与上传已暂停，WiFi 连上后自动收起）");
+}
+
 /* ============================ 内部函数：定时器 ============================ */
 
 /**
@@ -509,10 +658,22 @@ static void ui_timer_cb(lv_timer_t *timer)
                 }
                 break;
 
+            case CHAT_MSG_WIFI_ALERT:
+                /* WiFi 未连接时按下录音键：弹出提示（状态机没开始录音，
+                 * 也不会尝试上传）。重复消息不会叠出第二个弹窗。 */
+                ui_wifi_alert_open();
+                break;
+
             default:
                 break;
             }
         }
+    }
+
+    /* WiFi 连上了：自动收起「WiFi未连接」提示弹窗，恢复录音与上传 */
+    if (s_wifi_alert_modal != NULL && app_wifi_is_connected()) {
+        ESP_LOGI(TAG, "WiFi 已连接，自动关闭「WiFi未连接」提示弹窗");
+        ui_wifi_alert_close();
     }
 
     /* 2. 打字机节拍 */
@@ -589,8 +750,8 @@ static void ui_bk_close(void)
         s_bk_value_lbl = NULL;
         ESP_LOGI(TAG, "背光设置弹窗已关闭（当前 %d%%）", app_settings_get_backlight());
     }
-    /* 弹窗都关掉了才恢复录音按键（万一 WiFi 弹窗还开着就别清这个标记） */
-    if (!app_wifi_ui_is_open()) {
+    /* 其它弹窗（WiFi 列表 / “WiFi未连接”提示）都关掉了才恢复录音按键 */
+    if (!ui_modal_present()) {
         app_bus_set_ui_modal(false);
     }
 }

@@ -89,6 +89,9 @@ typedef enum {
     CHAT_MSG_STATUS,            /*!< 底部状态行 */
     CHAT_MSG_ERROR,             /*!< 底部状态行（红色，显示几秒） */
     CHAT_MSG_WIFI,              /*!< 顶部 WiFi 状态 */
+    CHAT_MSG_WIFI_ALERT,        /*!< WiFi 未连接提示：界面弹出“WiFi未连接”提示框
+                                 *   （WiFi 未连接时按下录音键由 app_key_task 投递；
+                                 *    界面收到后弹窗，WiFi 一连上就自动收起） */
 } chat_msg_type_t;
 
 /** 聊天消息 */

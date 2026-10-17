@@ -8,6 +8,7 @@
 #include "app_key.h"
 #include "app_bus.h"
 #include "app_config.h"
+#include "app_wifi.h"           /* 按下录音键前先看 WiFi 连没连（未连接就不录音、不上传） */
 
 #include "bsp/bsp_gpio.h"
 
@@ -204,9 +205,21 @@ static void flow_begin_recording(void)
  * @brief  结束一轮录音并把数据交给网络任务
  *
  * @param  discard true = 录音太短，丢弃不放
+ *
+ * @note   松手时如果 WiFi 已经断开，这里直接丢弃、**不进入上传流程**
+ *         （需求：WiFi 未连接时不再尝试上传，直到连上才恢复）。
+ *         这样网络任务连 PCM 消息都收不到，连“白等 20 秒”都不会发生。
  */
 static void flow_end_recording(bool discard)
 {
+    if (!discard && !app_wifi_is_connected()) {
+        ESP_LOGW(TAG, "录音结束时 WiFi 已断开，丢弃本次录音（不尝试上传）");
+        app_bus_post_audio_cmd(APP_AUDIO_CMD_STOP, true);   /* discard：录音器回到安全状态 */
+        app_bus_post_chat(CHAT_MSG_ERROR, "WiFi 已断线，本次录音未上传");
+        app_bus_set_state(APP_STATE_IDLE);
+        return;
+    }
+
     app_bus_post_audio_cmd(APP_AUDIO_CMD_STOP, discard);
 
     if (discard) {
@@ -256,6 +269,21 @@ void app_key_task(void *arg)
                     ESP_LOGW(TAG, "当前状态不允许录音（%s），忽略这次按下",
                              app_bus_state_text(state));
                     app_bus_post_chat(CHAT_MSG_STATUS, app_bus_state_text(state));
+                    break;
+                }
+                /*
+                 * WiFi 未连接：不开始录音、不进入上传流程，只弹窗提示。
+                 *
+                 * 为什么在“按下”这一步就拦：录音一旦开始，松手就会把 PCM 投给网络任务，
+                 * 而未连接时上传注定失败（还会白占 20 秒等链路）。所以直接在这里挡住，
+                 * 并把「WiFi未连接」投给界面弹窗（CHAT_MSG_WIFI_ALERT）。
+                 * 真正的兜底在 app_net_task 里（录音途中掉线那种情况也不会尝试上传）。
+                 * 界面弹窗会置“界面模态”，弹窗开着时继续按也只会被忽略；
+                 * 等 WiFi 连上，界面自动收起弹窗，按键录音随之恢复。
+                 */
+                if (!app_wifi_is_connected()) {
+                    ESP_LOGW(TAG, "WiFi 未连接，忽略本次录音并弹出提示");
+                    app_bus_post_chat(CHAT_MSG_WIFI_ALERT, "WiFi未连接");
                     break;
                 }
                 press_tick = xTaskGetTickCount();
