@@ -22,6 +22,7 @@
 #define __APP_SETTINGS_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -68,6 +69,46 @@ esp_err_t app_settings_set_backlight(int percent, bool persist);
  * @brief  把当前亮度写回 TF 卡（等价于 app_settings_set_backlight(当前值, true)）
  */
 esp_err_t app_settings_save(void);
+
+/* ============================ 自动休眠 ============================ */
+
+/**
+ * @brief  当前“长时间静止后进入省电模式”的超时（毫秒）
+ *
+ * @return APP_POWER_TIMEOUT_30S / APP_POWER_TIMEOUT_60S / APP_POWER_TIMEOUT_NEVER(0)
+ *
+ * @note   这个值只存在内部 NVS（键 sleep_ms），不进 TF 卡上的亮度设置文件：
+ *         亮度的文件格式已经稳定，不再动它，避免“手改过设置文件的人”升级后
+ *         被写成两种格式。
+ */
+uint32_t app_settings_get_sleep_timeout_ms(void);
+
+/**
+ * @brief  设置自动休眠超时并持久化到 NVS
+ *
+ * @param  timeout_ms APP_POWER_TIMEOUT_* 之一（其它值会被归一到三个档位）
+ * @return ESP_OK 已保存；NVS 打不开/写失败时返回错误码（内存里的值仍然已更新）
+ */
+esp_err_t app_settings_set_sleep_timeout_ms(uint32_t timeout_ms);
+
+/* ============================ IMU 唤醒灵敏度 ============================ */
+
+/**
+ * @brief  当前 IMU 唤醒灵敏度档位
+ *
+ * @return APP_POWER_IMU_SENS_WEAK(0) / MED(1) / STRONG(2)；默认中档
+ *
+ * @note   和休眠超时一样只存内部 NVS（键 imu_sens），不进 TF 卡设置文件。
+ */
+uint8_t app_settings_get_imu_sensitivity(void);
+
+/**
+ * @brief  设置 IMU 唤醒灵敏度并持久化到 NVS
+ *
+ * @param  level 0 = 弱，1 = 中，2 = 强；越界值收敛到中档（1）
+ * @return ESP_OK 已保存；NVS 打不开/写失败时返回错误码（内存里的值仍然已更新）
+ */
+esp_err_t app_settings_set_imu_sensitivity(uint8_t level);
 
 /* ============================ 其它 ============================ */
 

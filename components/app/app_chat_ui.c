@@ -35,7 +35,8 @@
 #include "app_chat_ui.h"
 #include "app_config.h"
 #include "app_gb2312.h"
-#include "app_settings.h"           /* 背光设置：太阳图标弹窗用它读写/持久化 */
+#include "app_power.h"              /* 设置页：休眠超时的读写 + 活动通知 */
+#include "app_settings.h"           /* 设置页：亮度读写/持久化 */
 #include "app_time.h"               /* 待机时在状态行后面挂一个 HH:MM */
 #include "app_wifi.h"               /* WiFi 连没连：决定“WiFi未连接”提示弹窗要不要自动收起 */
 #include "app_wifi_ui.h"            /* WiFi 文字按钮点开“附近 WiFi”弹窗 */
@@ -65,13 +66,11 @@ static lv_obj_t        *s_wifi_lbl    = NULL;   /*!< 顶部 WiFi 状态文字（
 static lv_obj_t        *s_rec_flag    = NULL;   /*!< 顶部录音/处理指示 */
 static lv_timer_t      *s_timer       = NULL;
 
-/** 背光设置弹窗（NULL = 没打开）；里面的控件在关闭时一起删掉 */
-static lv_obj_t        *s_bk_modal    = NULL;
-static lv_obj_t        *s_bk_slider   = NULL;
-static lv_obj_t        *s_bk_value_lbl = NULL;
-
 /** 「WiFi未连接」提示弹窗（NULL = 没打开）；控件在关闭时一起删掉 */
 static lv_obj_t        *s_wifi_alert_modal = NULL;
+
+/** 设置二级页（NULL = 还没建；懒创建，建好一直复用） */
+static lv_obj_t        *s_set_scr = NULL;
 
 /** 当前显示的气泡行（用于超量时删除最老的） */
 static lv_obj_t        *s_rows[APP_CHAT_MAX_BUBBLES];
@@ -474,7 +473,7 @@ static void ui_set_status(const char *text, bool is_error)
  */
 static bool ui_modal_present(void)
 {
-    return (s_bk_modal != NULL) || (s_wifi_alert_modal != NULL) || app_wifi_ui_is_open();
+    return (s_wifi_alert_modal != NULL) || app_wifi_ui_is_open();
 }
 
 /**
@@ -723,228 +722,430 @@ static void ui_timer_cb(lv_timer_t *timer)
     }
 }
 
-/* ============================ 内部函数：背光设置弹窗 ============================ */
+/* ============================ 内部函数：设置二级页 ============================ */
+
+static void ui_settings_open(void);        /* 前向声明：按钮回调在上面 */
 
 /**
- * @brief  更新弹窗里的“亮度 xx%”文字
+ * @brief  “进入休眠的时间”三个可选项（对应 app_config.h 里的超时常量）
  */
-static void ui_bk_update_value_label(int value)
+static const struct {
+    const char *text;
+    uint32_t    timeout_ms;
+} s_sleep_options[3] = {
+    { "30 秒",  APP_POWER_TIMEOUT_30S },
+    { "1 分钟", APP_POWER_TIMEOUT_60S },
+    { "永不",   APP_POWER_TIMEOUT_NEVER },
+};
+
+/**
+ * @brief  “IMU 唤醒阈值”三个可选项（对应 app_config.h 里的灵敏度档位）
+ */
+static const struct {
+    const char *text;
+    uint8_t     level;
+} s_imu_options[3] = {
+    { "弱", APP_POWER_IMU_SENS_WEAK },
+    { "中", APP_POWER_IMU_SENS_MED },
+    { "强", APP_POWER_IMU_SENS_STRONG },
+};
+
+/** 设置页里的三个休眠选项按钮（建页时填，用于高亮当前选中项） */
+static lv_obj_t *s_set_sleep_btn[3] = { NULL, NULL, NULL };
+/** 设置页里的三个 IMU 灵敏度按钮（同上） */
+static lv_obj_t *s_set_imu_btn[3]   = { NULL, NULL, NULL };
+/** 设置页里的亮度滑条 / 百分比文字 */
+static lv_obj_t *s_set_bk_slider    = NULL;
+static lv_obj_t *s_set_bk_value_lbl = NULL;
+
+/**
+ * @brief  刷新“亮度 xx%”文字
+ */
+static void ui_set_update_brightness_label(int value)
 {
-    if (s_bk_value_lbl == NULL) {
+    if (s_set_bk_value_lbl == NULL) {
         return;
     }
     char buf[32];
-    snprintf(buf, sizeof(buf), "亮度 %d%%", value);
-    lv_label_set_text(s_bk_value_lbl, buf);
+    snprintf(buf, sizeof(buf), "%d%%", value);
+    lv_label_set_text(s_set_bk_value_lbl, buf);
 }
 
 /**
- * @brief  关闭弹窗（只删遮罩，里面的控件都是它的子对象，会一起删掉）
+ * @brief  按当前生效的超时高亮对应的选项按钮
  */
-static void ui_bk_close(void)
+static void ui_set_refresh_sleep_buttons(void)
 {
-    if (s_bk_modal != NULL) {
-        lv_obj_delete(s_bk_modal);
-        s_bk_modal     = NULL;
-        s_bk_slider    = NULL;
-        s_bk_value_lbl = NULL;
-        ESP_LOGI(TAG, "背光设置弹窗已关闭（当前 %d%%）", app_settings_get_backlight());
-    }
-    /* 其它弹窗（WiFi 列表 / “WiFi未连接”提示）都关掉了才恢复录音按键 */
-    if (!ui_modal_present()) {
-        app_bus_set_ui_modal(false);
+    uint32_t current = app_power_get_timeout_ms();
+
+    for (int i = 0; i < 3; i++) {
+        if (s_set_sleep_btn[i] == NULL) {
+            continue;
+        }
+        bool selected = (current == s_sleep_options[i].timeout_ms);
+        lv_obj_set_style_bg_color(s_set_sleep_btn[i],
+                                  lv_color_hex(selected ? APP_COLOR_USER_BUBBLE : APP_COLOR_PANEL),
+                                  LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(s_set_sleep_btn[i], LV_OPA_COVER, LV_PART_MAIN);
     }
 }
 
 /**
- * @brief  滑条回调：**拖动时实时**改亮度（但不写卡）
- *
- * @note   写卡只在【确认】时做一次：
- *         滑条每动一格就写一次 TF 卡既慢又费卡，而且没必要。
+ * @brief  按当前生效的 IMU 灵敏度档位高亮对应的选项按钮
  */
-static void ui_bk_slider_cb(lv_event_t *e)
+static void ui_set_refresh_imu_buttons(void)
+{
+    uint8_t current = app_power_get_imu_sensitivity();
+
+    for (int i = 0; i < 3; i++) {
+        if (s_set_imu_btn[i] == NULL) {
+            continue;
+        }
+        bool selected = (current == s_imu_options[i].level);
+        lv_obj_set_style_bg_color(s_set_imu_btn[i],
+                                  lv_color_hex(selected ? APP_COLOR_USER_BUBBLE : APP_COLOR_PANEL),
+                                  LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(s_set_imu_btn[i], LV_OPA_COVER, LV_PART_MAIN);
+    }
+}
+
+/**
+ * @brief  亮度滑条：拖动时实时生效（不写卡），松手才写卡
+ *
+ * @note   和原来的弹窗一样：拖动过程中反复写 TF 卡既慢又费卡，没必要。
+ */
+static void ui_set_brightness_cb(lv_event_t *e)
 {
     lv_obj_t *slider = lv_event_get_target(e);
     int       value  = (int)lv_slider_get_value(slider);
 
-    ui_bk_update_value_label(value);
-    app_settings_set_backlight(value, false);       /* persist = false */
+    app_settings_set_backlight(value, false);       /* persist = false：只生效 */
+    ui_set_update_brightness_label(value);
+
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        esp_err_t err = app_settings_set_backlight(value, true);
+        if (err != ESP_OK) {
+            app_bus_post_chatf(CHAT_MSG_ERROR, "亮度已生效，但保存失败(%s)",
+                               esp_err_to_name(err));
+        }
+    }
 }
 
 /**
- * @brief  确认按钮：保存亮度到 TF 卡并关闭弹窗
+ * @brief  休眠时间选项被点击：保存并刷新高亮
  */
-static void ui_bk_confirm_cb(lv_event_t *e)
+static void ui_set_sleep_cb(lv_event_t *e)
+{
+    uint32_t timeout_ms = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+
+    esp_err_t err = app_power_set_timeout_ms(timeout_ms);
+    ui_set_refresh_sleep_buttons();
+
+    if (err != ESP_OK) {
+        app_bus_post_chatf(CHAT_MSG_ERROR, "休眠时间已生效，但保存失败(%s)",
+                           esp_err_to_name(err));
+    }
+    ESP_LOGI(TAG, "休眠时间设置为 %u ms（0=永不）", (unsigned)timeout_ms);
+}
+
+/**
+ * @brief  IMU 唤醒阈值档位被点击：保存并刷新高亮
+ */
+static void ui_set_imu_cb(lv_event_t *e)
+{
+    uint8_t level = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+
+    esp_err_t err = app_power_set_imu_sensitivity(level);
+    ui_set_refresh_imu_buttons();
+
+    if (err != ESP_OK) {
+        app_bus_post_chatf(CHAT_MSG_ERROR, "IMU 阈值已生效，但保存失败(%s)",
+                           esp_err_to_name(err));
+    }
+    ESP_LOGI(TAG, "IMU 唤醒阈值设置为 %s（%u）",
+             (level == APP_POWER_IMU_SENS_WEAK)   ? "弱"
+             : (level == APP_POWER_IMU_SENS_STRONG) ? "强"
+                                                   : "中",
+             (unsigned)level);
+}
+
+/**
+ * @brief  左上角【返回】：回到聊天主界面
+ */
+static void ui_set_back_cb(lv_event_t *e)
 {
     (void)e;
 
-    int value = (s_bk_slider != NULL) ? (int)lv_slider_get_value(s_bk_slider)
-                                      : app_settings_get_backlight();
-
-    esp_err_t err = app_settings_set_backlight(value, true);
-    if (err != ESP_OK) {
-        /* TF 卡不可用：亮度已经生效，只是重启后会回到默认值——如实告诉用户 */
-        app_bus_post_chatf(CHAT_MSG_ERROR, "亮度已生效，但保存失败(%s)",
-                           esp_err_to_name(err));
+    app_bus_set_ui_page(false);
+    if (s_scr != NULL) {
+        lv_screen_load(s_scr);
     }
-    ui_bk_close();
+    app_power_notify_activity();
+    ESP_LOGI(TAG, "退出设置页");
 }
 
 /**
- * @brief  打开背光设置弹窗
+ * @brief  创建设置二级页（只建一次，之后反复复用）
  *
- * @note   弹窗是 s_scr 的子对象（盖在最上层）+ 半透明遮罩，
- *         遮罩自身可点击，用来吃掉对下面控件的误触；
- *         **只有【确认】会关闭它**，避免用户以为“点外面=取消”而实际亮度已经改了。
+ * 布局：顶部一条（左【返回】、中“设置”），下面是
+ *       “进入休眠的时间” 30 秒 / 1 分钟 / 永不 三个并排按钮，
+ *       再下面是“屏幕亮度” 滑条 + 百分比。
  */
-static void ui_bk_open(void)
+static void ui_set_build(void)
 {
-    if (s_bk_modal != NULL || s_scr == NULL) {
-        return;                         /* 已经打开 / 界面还没建好 */
+    s_set_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_set_scr, lv_color_hex(APP_COLOR_BG), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_set_scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_set_scr, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_set_scr, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_set_scr, 0, LV_PART_MAIN);
+    lv_obj_set_scrollable(s_set_scr, false);
+
+    /* ---------- 顶部条 + 返回按钮 ---------- */
+    lv_obj_t *bar = lv_obj_create(s_set_scr);
+    lv_obj_set_size(bar, LV_PCT(100), APP_CHAT_TOPBAR_H);
+    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
+    ui_obj_base(bar, lv_color_hex(APP_COLOR_TOPBAR));
+    lv_obj_set_scrollable(bar, false);
+
+    lv_obj_t *back = lv_button_create(bar);
+    lv_obj_set_size(back, 52, APP_CHAT_TOPBAR_H - 4);
+    lv_obj_align(back, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_set_style_bg_color(back, lv_color_hex(APP_COLOR_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(back, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(back, 4, LV_PART_MAIN);
+    lv_obj_set_style_border_width(back, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(back, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(back, ui_set_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_lbl = lv_label_create(back);
+    lv_label_set_text(back_lbl, "返回");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(back_lbl, s_font, LV_PART_MAIN);
     }
+    lv_obj_set_style_text_color(back_lbl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_center(back_lbl);
 
-    /* ---------- 1. 遮罩 ---------- */
-    lv_obj_t *mask = lv_obj_create(s_scr);
-    lv_obj_set_size(mask, LV_PCT(100), LV_PCT(100));
-    lv_obj_center(mask);
-    lv_obj_set_style_bg_color(mask, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(mask, LV_OPA_60, LV_PART_MAIN);
-    lv_obj_set_style_border_width(mask, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(mask, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(mask, 0, LV_PART_MAIN);
-    lv_obj_set_scrollable(mask, false);
-    lv_obj_set_clickable(mask, true);       /* 遮罩自己吃掉点击，别穿到下面的控件 */
-
-    /* ---------- 2. 面板 ---------- */
-    lv_obj_t *panel = lv_obj_create(mask);
-    lv_obj_set_size(panel, 280, 150);
-    lv_obj_center(panel);
-    lv_obj_set_style_radius(panel, 10, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(panel, lv_color_hex(APP_COLOR_PANEL), LV_PART_MAIN);
-    lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(panel, lv_color_hex(APP_COLOR_WARN), LV_PART_MAIN);
-    lv_obj_set_style_pad_all(panel, 10, LV_PART_MAIN);
-    lv_obj_set_scrollable(panel, false);
-
-    /* ---------- 3. 标题 ---------- */
-    lv_obj_t *title = lv_label_create(panel);
-    lv_label_set_text(title, "屏幕背光设置");
+    lv_obj_t *title = lv_label_create(bar);
+    lv_label_set_text(title, "设置");
     if (s_font != NULL) {
         lv_obj_set_style_text_font(title, s_font, LV_PART_MAIN);
     }
     lv_obj_set_style_text_color(title, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
 
-    /* ---------- 4. 当前亮度 ---------- */
-    s_bk_value_lbl = lv_label_create(panel);
+    /* ---------- 进入休眠的时间 ---------- */
+    /* 纵向排布（屏高 240、顶栏 26）：三组控件各占一个“标题 + 一行”，
+     * 行高压到 30~38，保证 3 组都在屏内且不重叠：
+     *   34..50   “进入休眠的时间”标题
+     *   52..90   30 秒 / 1 分钟 / 永不 三个按钮
+     *   96..112  “IMU 唤醒阈值”标题
+     *   114..152 弱 / 中 / 强 三个按钮
+     *   160..176 “屏幕亮度”标题
+     *   182..200 亮度滑条
+     *   206..222 底部小字说明 */
+    int y = APP_CHAT_TOPBAR_H + 8;
+
+    lv_obj_t *lbl_sleep = lv_label_create(s_set_scr);
+    lv_label_set_text(lbl_sleep, "进入休眠的时间");
     if (s_font != NULL) {
-        lv_obj_set_style_text_font(s_bk_value_lbl, s_font, LV_PART_MAIN);
+        lv_obj_set_style_text_font(lbl_sleep, s_font, LV_PART_MAIN);
     }
-    lv_obj_set_style_text_color(s_bk_value_lbl, lv_color_hex(APP_COLOR_WARN), LV_PART_MAIN);
-    lv_obj_align(s_bk_value_lbl, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_set_style_text_color(lbl_sleep, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(lbl_sleep, LV_ALIGN_TOP_LEFT, 12, y);
 
-    /* ---------- 5. 亮度滑条（0~100，拖动实时生效） ---------- */
-    int current = app_settings_get_backlight();
+    lv_obj_t *row = lv_obj_create(s_set_scr);
+    lv_obj_set_size(row, LV_PCT(100), 38);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, y + 18);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(row, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(row, 8, LV_PART_MAIN);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scrollable(row, false);
 
-    s_bk_slider = lv_slider_create(panel);
-    lv_obj_set_width(s_bk_slider, 240);
-    lv_obj_set_height(s_bk_slider, 20);
-    lv_slider_set_range(s_bk_slider, 0, 100);
-    lv_slider_set_value(s_bk_slider, current, LV_ANIM_OFF);
-    lv_obj_align(s_bk_slider, LV_ALIGN_TOP_MID, 0, 54);
-    lv_obj_add_event_cb(s_bk_slider, ui_bk_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    ui_bk_update_value_label(current);
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *btn = lv_button_create(row);
+        lv_obj_set_size(btn, 88, 30);
+        lv_obj_set_style_radius(btn, 6, LV_PART_MAIN);
+        lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(btn, lv_color_hex(APP_COLOR_WARN), LV_PART_MAIN);
+        lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
+        lv_obj_add_event_cb(btn, ui_set_sleep_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)s_sleep_options[i].timeout_ms);
 
-    /* ---------- 6. 确认按钮 ---------- */
-    lv_obj_t *btn = lv_button_create(panel);
-    lv_obj_set_size(btn, 100, 32);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_radius(btn, 6, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(APP_COLOR_USER_BUBBLE), LV_PART_MAIN);
-    lv_obj_add_event_cb(btn, ui_bk_confirm_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, s_sleep_options[i].text);
+        if (s_font != NULL) {
+            lv_obj_set_style_text_font(bl, s_font, LV_PART_MAIN);
+        }
+        lv_obj_set_style_text_color(bl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+        lv_obj_center(bl);
 
-    lv_obj_t *btn_lbl = lv_label_create(btn);
-    lv_label_set_text(btn_lbl, "确认");
+        s_set_sleep_btn[i] = btn;
+    }
+
+    /* ---------- IMU 唤醒阈值（弱 / 中 / 强，只影响 IMU，触摸不受影响） ---------- */
+    y += 62;
+
+    lv_obj_t *lbl_imu = lv_label_create(s_set_scr);
+    lv_label_set_text(lbl_imu, "IMU 唤醒阈值");
     if (s_font != NULL) {
-        lv_obj_set_style_text_font(btn_lbl, s_font, LV_PART_MAIN);
+        lv_obj_set_style_text_font(lbl_imu, s_font, LV_PART_MAIN);
     }
-    lv_obj_set_style_text_color(btn_lbl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
-    lv_obj_center(btn_lbl);
+    lv_obj_set_style_text_color(lbl_imu, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(lbl_imu, LV_ALIGN_TOP_LEFT, 12, y);
 
-    s_bk_modal = mask;
+    lv_obj_t *imu_row = lv_obj_create(s_set_scr);
+    lv_obj_set_size(imu_row, LV_PCT(100), 38);
+    lv_obj_align(imu_row, LV_ALIGN_TOP_MID, 0, y + 18);
+    lv_obj_set_style_bg_opa(imu_row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(imu_row, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(imu_row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(imu_row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(imu_row, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(imu_row, 8, LV_PART_MAIN);
+    lv_obj_set_flex_flow(imu_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(imu_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scrollable(imu_row, false);
 
-    /* 弹窗期间按住录音键不生效（用户正在拖滑条，别冒出“录音中...”） */
-    app_bus_set_ui_modal(true);
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *btn = lv_button_create(imu_row);
+        lv_obj_set_size(btn, 88, 30);
+        lv_obj_set_style_radius(btn, 6, LV_PART_MAIN);
+        lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(btn, lv_color_hex(APP_COLOR_WARN), LV_PART_MAIN);
+        lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
+        lv_obj_add_event_cb(btn, ui_set_imu_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)s_imu_options[i].level);
 
-    ESP_LOGI(TAG, "打开背光设置弹窗（当前 %d%%，范围 0~100，实际下限 %d%%）",
-             current, APP_LCD_BRIGHTNESS_MIN);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, s_imu_options[i].text);
+        if (s_font != NULL) {
+            lv_obj_set_style_text_font(bl, s_font, LV_PART_MAIN);
+        }
+        lv_obj_set_style_text_color(bl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+        lv_obj_center(bl);
+
+        s_set_imu_btn[i] = btn;
+    }
+
+    /* ---------- 屏幕亮度 ---------- */
+    y += 64;
+
+    lv_obj_t *lbl_bk = lv_label_create(s_set_scr);
+    lv_label_set_text(lbl_bk, "屏幕亮度");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(lbl_bk, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(lbl_bk, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(lbl_bk, LV_ALIGN_TOP_LEFT, 12, y);
+
+    s_set_bk_value_lbl = lv_label_create(s_set_scr);
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(s_set_bk_value_lbl, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(s_set_bk_value_lbl, lv_color_hex(APP_COLOR_WARN), LV_PART_MAIN);
+    lv_obj_align(s_set_bk_value_lbl, LV_ALIGN_TOP_RIGHT, -12, y);
+
+    s_set_bk_slider = lv_slider_create(s_set_scr);
+    lv_obj_set_width(s_set_bk_slider, LV_PCT(92));
+    lv_obj_set_height(s_set_bk_slider, 18);
+    lv_slider_set_range(s_set_bk_slider, 0, 100);
+    lv_obj_align(s_set_bk_slider, LV_ALIGN_TOP_MID, 0, y + 22);
+    lv_obj_add_event_cb(s_set_bk_slider, ui_set_brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_set_bk_slider, ui_set_brightness_cb, LV_EVENT_RELEASED, NULL);
+
+    /* ---------- 底部一行小字说明（单行，240 高屏也放得下：206..225） ---------- */
+    lv_obj_t *hint = lv_label_create(s_set_scr);
+    lv_label_set_text(hint, "弱=轻碰就醒，强=需要明显晃动");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(hint, s_font, LV_PART_MAIN);
+    }
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x8A9BA8), LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 12, y + 46);
+
+    ui_set_refresh_sleep_buttons();
+    ui_set_refresh_imu_buttons();
 }
 
 /**
- * @brief  太阳图标被点击
+ * @brief  进入设置二级页（懒创建 + 同步当前值）
  */
-static void ui_sun_clicked_cb(lv_event_t *e)
+static void ui_settings_open(void)
+{
+    if (s_set_scr == NULL) {
+        ui_set_build();
+    }
+    if (s_set_scr == NULL) {
+        return;
+    }
+
+    /* 每次进来都按“当前生效值”同步一遍，避免显示旧值 */
+    ui_set_refresh_sleep_buttons();
+    ui_set_refresh_imu_buttons();
+
+    int bk = app_settings_get_backlight();
+    if (s_set_bk_slider != NULL) {
+        lv_slider_set_value(s_set_bk_slider, bk, LV_ANIM_OFF);
+    }
+    ui_set_update_brightness_label(bk);
+
+    lv_screen_load(s_set_scr);
+
+    /* 设置页打开期间：录音键不生效；但它不是“弹窗”，不阻止自动省电
+     * （用户停在设置页走开，屏幕一样该暗下来）。 */
+    app_bus_set_ui_page(true);
+    app_power_notify_activity();
+
+    ESP_LOGI(TAG, "打开设置页（休眠超时 %u ms，IMU 灵敏度 %u，亮度 %d%%）",
+             (unsigned)app_power_get_timeout_ms(),
+             (unsigned)app_power_get_imu_sensitivity(), bk);
+}
+
+/**
+ * @brief  顶栏“设置”被点击：进入设置二级页
+ */
+static void ui_settings_clicked_cb(lv_event_t *e)
 {
     (void)e;
-    ui_bk_open();
+    ui_settings_open();
 }
 
 /**
- * @brief  创建“太阳”小图标（纯 LVGL 基本图形画的，不依赖图片资源）
+ * @brief  创建顶栏“设置”文字按钮
  *
- * @note   画法：18×18 的可点击容器 + 中间 10×10 实心黄圆 + 上下左右 4 根小光线。
- *         子对象都清掉 CLICKABLE，这样点在圆或光线上也会冒泡给容器，
- *         不会出现“点中间没反应、点边上才有”的怪现象。
- * @note   为什么不用字体图标：中文字库是 GB2312 点阵，里面没有 ☀ 这种符号；
- *         而 LVGL 内置符号字体在这块板上也没挂到中文 label 上，画基本图形最稳。
+ * @param  parent 顶栏里的横向容器
+ * @note   原来是太阳图标（直接改亮度），现在换成文字按钮进二级页，
+ *         亮度设置搬到二级页里了（需求要求）。
  */
-static lv_obj_t *ui_create_sun_button(lv_obj_t *parent)
+static lv_obj_t *ui_create_settings_button(lv_obj_t *parent)
 {
-    static const struct {
-        int      w;
-        int      h;
-        lv_align_t align;
-    } rays[4] = {
-        { 2, 4, LV_ALIGN_TOP_MID },
-        { 2, 4, LV_ALIGN_BOTTOM_MID },
-        { 4, 2, LV_ALIGN_LEFT_MID },
-        { 4, 2, LV_ALIGN_RIGHT_MID },
-    };
-    const lv_color_t sun = lv_color_hex(APP_COLOR_WARN);
-
-    lv_obj_t *btn = lv_obj_create(parent);
-    lv_obj_set_size(btn, 18, 18);
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(btn, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(btn, 2, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
     lv_obj_set_scrollable(btn, false);
-    lv_obj_set_clickable(btn, true);
-    lv_obj_add_event_cb(btn, ui_sun_clicked_cb, LV_EVENT_CLICKED, NULL);
+    /* 按下时给一点浅色底，和 WiFi 按钮保持一致的手感 */
+    lv_obj_set_style_bg_color(btn, lv_color_hex(APP_COLOR_WARN), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_30, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(btn, ui_settings_clicked_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 中间那个圆 */
-    lv_obj_t *core = lv_obj_create(btn);
-    lv_obj_set_size(core, 10, 10);
-    lv_obj_set_style_radius(core, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(core, sun, LV_PART_MAIN);
-    lv_obj_set_style_border_width(core, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(core, 0, LV_PART_MAIN);
-    lv_obj_set_scrollable(core, false);
-    lv_obj_set_clickable(core, false);      /* 点击冒泡给外层容器 */
-    lv_obj_center(core);
-
-    /* 四根光线 */
-    for (int i = 0; i < 4; i++) {
-        lv_obj_t *ray = lv_obj_create(btn);
-        lv_obj_set_size(ray, rays[i].w, rays[i].h);
-        lv_obj_set_style_bg_color(ray, sun, LV_PART_MAIN);
-        lv_obj_set_style_border_width(ray, 0, LV_PART_MAIN);
-        lv_obj_set_style_radius(ray, 0, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(ray, 0, LV_PART_MAIN);
-        lv_obj_set_scrollable(ray, false);
-        lv_obj_set_clickable(ray, false);   /* 同样让点击冒泡给容器 */
-        lv_obj_align(ray, rays[i].align, 0, 0);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, "设置");
+    if (s_font != NULL) {
+        lv_obj_set_style_text_font(lbl, s_font, LV_PART_MAIN);
     }
+    lv_obj_set_style_text_color(lbl, lv_color_hex(APP_COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_center(lbl);
 
     return btn;
 }
@@ -1006,6 +1207,58 @@ static lv_obj_t *ui_create_wifi_button(lv_obj_t *parent)
 
 /* ============================ 对外接口 ============================ */
 
+/**
+ * @brief  在 LVGL 任务上下文里做一次“整屏强制重绘”（lv_async_call 的回调）
+ *
+ * 为什么要绕到异步回调：省电唤醒是在 app_power 任务里发生的，那里栈很紧
+ * （以前直接 lv_refr_now() 会 stack overflow）。lv_async_call 把“标脏 + 渲染”
+ * 排到 LVGL 自己的任务里执行，用的是 LVGL 任务的栈，安全。
+ *
+ * 日志意义：看到“LVGL 已在任务上下文强制重绘 / 强制刷新完成”，说明问题不在
+ * LVGL 没刷新；若此时屏幕仍无画面，就说明是面板/SPI 那条通路（对照 lcd.c 的
+ * “清屏探测”日志一起判断）。
+ */
+static void ui_force_redraw_async(void *p)
+{
+    (void)p;
+
+    ESP_LOGI(TAG, "LVGL 已在任务上下文强制重绘（screen=%p）", (void *)lv_screen_active());
+
+    /* UI 树自检：子对象数 > 0 说明界面对象还在（只是“没显示”），
+     * 子对象数 = 0 说明界面树本身被清空了（那才是“没内容”）。
+     * 和唤醒自检彩条对照：看得到彩条 + 子对象数 > 0 → 内容在、但 LVGL 输出没到屏上。 */
+    ESP_LOGI(TAG, "唤醒重绘检查：screen=%p 子对象数=%u 显示对象=%p",
+             (void *)lv_screen_active(),
+             (unsigned)lv_obj_get_child_count(lv_screen_active()),
+             (void *)lv_obj_get_display(lv_screen_active()));
+
+    lv_obj_invalidate(lv_screen_active());
+
+    /* 立刻跑一拍刷新，把“到底刷没刷”变成确定事实：
+     * 本函数运行在 LVGL 任务里，渲染开销和平时刷新一样，不会撑爆 app_power 的栈 */
+    lv_display_t *d = lcd_get_display();
+    if (d == NULL) {
+        d = lv_display_get_default();
+    }
+    if (d != NULL) {
+        lv_refr_now(d);
+        ESP_LOGI(TAG, "LVGL 强制刷新完成（lv_refr_now）");
+    } else {
+        ESP_LOGW(TAG, "找不到 LVGL display，跳过强制刷新");
+    }
+}
+
+/**
+ * @brief  请求 LVGL 在它自己的任务里强制重绘一次（线程安全）
+ *
+ * @note   必须在持有 LVGL 锁时调用（lv_async_call 会改 LVGL 内部链表）。
+ *         真正干活的是 ui_force_redraw_async()，在 lv_timer_handler 里被调用。
+ */
+void app_chat_ui_force_redraw_async(void)
+{
+    lv_async_call(ui_force_redraw_async, NULL);
+}
+
 esp_err_t app_chat_ui_init(const lv_font_t *cn_font)
 {
     if (s_scr != NULL) {
@@ -1034,10 +1287,11 @@ esp_err_t app_chat_ui_init(const lv_font_t *cn_font)
     lv_obj_align(topbar, LV_ALIGN_TOP_MID, 0, 0);
     ui_obj_base(topbar, lv_color_hex(APP_COLOR_TOPBAR));
 
-    /* 左上角：WiFi 文字按钮 + 太阳图标（背光设置入口）。
+    /* 左上角：WiFi 文字按钮 + “设置”文字按钮。
      * 用一个横向 flex 容器把两者排在一起，这样 WiFi 文字变长（WiFi未连接 ↔ WiFi 强）
-     * 时太阳图标会自动跟着移动，不需要手算坐标。
-     * WiFi 那一段是个**按钮**：点一下弹出附近 WiFi 列表（见 app_wifi_ui.c）。 */
+     * 时“设置”会自动跟着移动，不需要手算坐标。
+     * WiFi 那一段是个**按钮**：点一下弹出附近 WiFi 列表（见 app_wifi_ui.c）。
+     * “设置”按钮点开二级页（休眠时间 + 屏幕亮度，见本文件设置页部分）。 */
     lv_obj_t *left_box = lv_obj_create(topbar);
     lv_obj_set_size(left_box, LV_SIZE_CONTENT, LV_PCT(100));
     lv_obj_set_flex_flow(left_box, LV_FLEX_FLOW_ROW);
@@ -1045,13 +1299,14 @@ esp_err_t app_chat_ui_init(const lv_font_t *cn_font)
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     ui_obj_base(left_box, lv_color_hex(APP_COLOR_TOPBAR));      /* 与顶栏同色 = 视觉透明 */
     lv_obj_set_style_pad_left(left_box, 6, LV_PART_MAIN);       /* 注意：要在 base 之后再设 */
-    lv_obj_set_style_pad_column(left_box, 6, LV_PART_MAIN);     /* 文字与图标间距 */
+    lv_obj_set_style_pad_column(left_box, 6, LV_PART_MAIN);     /* 文字与按钮间距 */
     lv_obj_align(left_box, LV_ALIGN_LEFT_MID, 0, 0);
 
     s_wifi_btn = ui_create_wifi_button(left_box);
     (void)s_wifi_btn;
 
-    ui_create_sun_button(left_box);
+    /* 亮度设置已经搬到设置二级页里，这里只留一个“设置”入口 */
+    ui_create_settings_button(left_box);
 
     s_rec_flag = lv_label_create(topbar);
     lv_label_set_text(s_rec_flag, "待机");

@@ -39,6 +39,7 @@ endif()
 #     app_web_search.c              Tavily 联网搜索（DeepSeek Function Calling 工具）
 #     app_time.c                    SNTP 对时 + 时间格式化（喂给界面与大模型）
 #     app_settings.c                TF 卡上的用户设置（背光亮度持久化）
+#     app_power.c                   低功耗：IMU+触摸静止检测 -> 关屏/WiFi 省电 -> light sleep
 #     app_wifi_store.c              连过的 WiFi 名单（SSID+密码）存内部 NVS，最多 10 个
 #     app_wifi_ui.c                 附近 WiFi 列表弹窗 + 小键盘输密码弹窗
 #     app_mem.c                     空闲任务里的内存监控（堆 / PSRAM / LVGL 池）
@@ -63,6 +64,7 @@ idf_component_register(
         "app_web_search.c"
         "app_time.c"
         "app_settings.c"
+        "app_power.c"
         "app_wifi_store.c"
         "app_wifi_ui.c"
         "app_mem.c"

@@ -37,6 +37,7 @@
 #include <unistd.h>                 /* read / write / fsync / close */
 #include <sys/stat.h>               /* stat / struct stat */
 #include <errno.h>
+#include <inttypes.h>               /* PRIu32 / PRId32（日志里打 seq、超时） */
 #include <dirent.h>                 /* 排查用：列 TF 卡根目录 */
 
 #include "app_settings.h"
@@ -62,6 +63,10 @@ static const char *TAG = "APP_SET";
 
 /** 当前亮度（-1 = 还没初始化） */
 static int  s_backlight = -1;
+/** 自动休眠超时（毫秒；-1 = 还没初始化，0 = 永不） */
+static int32_t s_sleep_ms = -1;
+/** IMU 唤醒灵敏度档位（-1 = 还没初始化，0/1/2 见 APP_POWER_IMU_SENS_*） */
+static int8_t  s_imu_sens = -1;
 /** 最近一次写盘是否成功（只用于日志去重，避免反复刷屏） */
 static bool s_last_save_ok = true;
 
@@ -231,6 +236,37 @@ static bool settings_ensure_mounted(void)
     }
     ESP_LOGI(TAG, "TF 卡挂载成功：%s", sdcard_get_mount_point());
     return true;
+}
+
+/**
+ * @brief  把休眠超时归一成三个受支持的档位
+ *
+ * @note   0 = 永不；45 秒以下算 30 秒；其余算 1 分钟。
+ *         这样手改 NVS / 旧固件留下的怪值不会让界面“三个按钮都不高亮”。
+ */
+static uint32_t settings_sanitize_sleep(uint32_t timeout_ms)
+{
+    if (timeout_ms == APP_POWER_TIMEOUT_NEVER) {
+        return APP_POWER_TIMEOUT_NEVER;
+    }
+    if (timeout_ms <= 45000u) {
+        return APP_POWER_TIMEOUT_30S;
+    }
+    return APP_POWER_TIMEOUT_60S;
+}
+
+/**
+ * @brief  把 IMU 灵敏度归一成三档（越界值一律当中档）
+ *
+ * @note   0 = 弱，1 = 中，2 = 强。手改 NVS 写进来的怪值不会让
+ *         设置页“三个按钮都不高亮”。
+ */
+static uint8_t settings_sanitize_imu_sens(uint8_t level)
+{
+    if (level >= APP_POWER_IMU_SENS_COUNT) {
+        return APP_POWER_IMU_SENS_DEFAULT;
+    }
+    return level;
 }
 
 /**
@@ -622,6 +658,35 @@ esp_err_t app_settings_init(void)
     s_seq       = (q_tf > q_nv) ? q_tf : q_nv;
     s_backlight = settings_clamp((value >= 0) ? value : APP_LCD_BRIGHTNESS_DEFAULT);
 
+    /* ---------- 1.5 休眠超时（只存 NVS，和亮度互不影响） ---------- */
+    s_sleep_ms = (int32_t)APP_POWER_TIMEOUT_DEFAULT_MS;
+    if (settings_nvs_open()) {
+        uint32_t  ms = 0;
+        esp_err_t e  = nvs_get_u32(s_nvs, APP_SETTINGS_NVS_KEY_SLEEP_MS, &ms);
+        if (e == ESP_OK) {
+            s_sleep_ms = (int32_t)settings_sanitize_sleep(ms);
+            ESP_LOGI(TAG, "NVS 里的休眠超时：%" PRIu32 " ms（归一后 %" PRId32 " ms）",
+                     ms, s_sleep_ms);
+        } else {
+            ESP_LOGI(TAG, "NVS 里还没有休眠设置，用默认 %" PRIu32 " ms",
+                     (uint32_t)APP_POWER_TIMEOUT_DEFAULT_MS);
+        }
+    }
+
+    /* ---------- 1.6 IMU 唤醒灵敏度（同样只存 NVS，默认中档） ---------- */
+    s_imu_sens = (int8_t)APP_POWER_IMU_SENS_DEFAULT;
+    if (settings_nvs_open()) {
+        uint32_t  lvl = 0;
+        esp_err_t e   = nvs_get_u32(s_nvs, APP_SETTINGS_NVS_KEY_IMU_SENS, &lvl);
+        if (e == ESP_OK) {
+            s_imu_sens = (int8_t)settings_sanitize_imu_sens((uint8_t)lvl);
+            ESP_LOGI(TAG, "NVS 里的 IMU 唤醒灵敏度：%" PRIu32 "（归一后 %d）",
+                     lvl, (int)s_imu_sens);
+        } else {
+            ESP_LOGI(TAG, "NVS 里还没有 IMU 灵敏度设置，用默认中档");
+        }
+    }
+
     /* ---------- 2. 立即应用（越早越好：lcd_init 里背光是 100%） ---------- */
     esp_err_t err = lcd_brightness_set(s_backlight);
     if (err != ESP_OK) {
@@ -748,6 +813,79 @@ esp_err_t app_settings_save(void)
 bool app_settings_sd_ready(void)
 {
     return sdcard_is_mounted();
+}
+
+/* ============================ 自动休眠超时 ============================ */
+
+uint32_t app_settings_get_sleep_timeout_ms(void)
+{
+    if (s_sleep_ms < 0) {
+        return APP_POWER_TIMEOUT_DEFAULT_MS;
+    }
+    return (uint32_t)s_sleep_ms;
+}
+
+esp_err_t app_settings_set_sleep_timeout_ms(uint32_t timeout_ms)
+{
+    uint32_t ms = settings_sanitize_sleep(timeout_ms);
+    s_sleep_ms  = (int32_t)ms;
+
+    if (!settings_nvs_open()) {
+        ESP_LOGW(TAG, "NVS 不可用，休眠设置只在本次运行有效");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = nvs_set_u32(s_nvs, APP_SETTINGS_NVS_KEY_SLEEP_MS, ms);
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "保存休眠设置失败：%s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "休眠超时已保存：%s（%" PRIu32 " ms）",
+             (ms == APP_POWER_TIMEOUT_NEVER) ? "永不自动休眠"
+                                             : ((ms >= APP_POWER_TIMEOUT_60S) ? "1 分钟" : "30 秒"),
+             ms);
+    return ESP_OK;
+}
+
+/* ============================ IMU 唤醒灵敏度 ============================ */
+
+uint8_t app_settings_get_imu_sensitivity(void)
+{
+    if (s_imu_sens < 0) {
+        return APP_POWER_IMU_SENS_DEFAULT;
+    }
+    return settings_sanitize_imu_sens((uint8_t)s_imu_sens);
+}
+
+esp_err_t app_settings_set_imu_sensitivity(uint8_t level)
+{
+    uint8_t lvl = settings_sanitize_imu_sens(level);
+    s_imu_sens  = (int8_t)lvl;
+
+    if (!settings_nvs_open()) {
+        ESP_LOGW(TAG, "NVS 不可用，IMU 灵敏度只在本次运行有效");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = nvs_set_u32(s_nvs, APP_SETTINGS_NVS_KEY_IMU_SENS, (uint32_t)lvl);
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "保存 IMU 灵敏度失败：%s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "IMU 唤醒灵敏度已保存：%s（%u）",
+             (lvl == APP_POWER_IMU_SENS_WEAK)   ? "弱"
+             : (lvl == APP_POWER_IMU_SENS_STRONG) ? "强"
+                                                  : "中",
+             (unsigned)lvl);
+    return ESP_OK;
 }
 
 /**

@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "id": "esp32-talking",
+  "name": "esp32-talking 项目约定",
+  "nodes": [
+    {
+      "id": "n1",
+      "parent": null,
+      "title": "esp32-talking（ESP32-S3 对话掌机）构建与踩坑",
+      "body": "工作区 E:\\esp32s3_v555\\esp32-talking，ESP-IDF v5.5.5（IDF 在 E:\\espidf_v5.5.5\\.espressif\\v5.5.5\\esp-idf，工具链在 C:\\Espressif\\tools）。不要用 D:\\esp\\v5.1.4。\n\n构建必须用 venv python 显式执行，**不要裸 `idf.py`、也不要 `. export.ps1`**：这台 Windows 上 idf.py 被文件关联到 PyCharm，裸调用只会弹 PyCharm/吐 JetBrains 日志栈、没有 ninja 输出。\n\n关键环境变量（pwsh，先设再跑）：\n$env:IDF_PATH='E:\\espidf_v5.5.5\\.espressif\\v5.5.5\\esp-idf'\n$env:IDF_TOOLS_PATH='C:\\Espressif\\tools'\n$env:IDF_PYTHON_ENV_PATH='C:\\Espressif\\tools\\python\\v5.5.5\\venv'\n$env:IDF_CCACHE_ENABLE='1'\n$env:ESP_ROM_ELF_DIR='C:\\Espressif\\tools\\esp-rom-elfs\\20241011/'\nPATH 前面加 C:\\Espressif\\tools\\{cmake\\3.30.2\\bin,ninja\\1.12.1,xtensa-esp-elf\\esp-14.2.0_20260121\\xtensa-esp-elf\\bin,ccache\\4.12.1\\...,python\\v5.5.5\\venv\\Scripts}\n\n命令：\n& 'C:\\Espressif\\tools\\python\\v5.5.5\\venv\\Scripts\\python.exe' 'E:\\espidf_v5.5.5\\.espressif\\v5.5.5\\esp-idf\\tools\\idf.py' -C 'E:\\esp32s3_v555\\esp32-talking' build\n产物 build/empty_proj.bin；怀疑增量构建掩盖问题时加 `fullclean` 再来一遍（ccache 下几分钟）。\n\n编码约定：源码 UTF-8 **无 BOM**，中文注释必须保留。不要用 PowerShell 5.1 的 Get-Content/Set-Content 改文件（按 GBK 破坏编码）；用 read/edit 工具或 -Encoding UTF8。\n\n已知噪声（不是本次改动引起，别动 sdkconfig/lv_conf）：LV_MEM_SIZE_KILOBYTES 弃用、LV_ASSERT_HANDLER_INCLUDE 弃用、ESP_IDF_VER_* 告警。\n\n什么时候该想起它：要在这个工程里跑编译/验证，或改动后不确定该用哪条命令构建时。",
+      "change": "added",
+      "at": "2026-10-27 20:52",
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n2",
+      "parent": "n1",
+      "title": "省电 light sleep 后屏幕“微亮/无 UI”的恢复顺序",
+      "body": "esp32-talking 的省电休眠用 CPU light sleep 轮询，唤醒后必须重建整条显示链，否则用户看到“只有微弱背光、界面不刷新”。\n\n正确顺序（components/app/app_power.c 的 power_enter_sleep / power_leave_sleep）：\n- 进入：lcd_lvgl_pause(true)（一直持锁，LVGL 停摆）→ esp_lcd_panel_disp_on_off(false) → lcd_backlight_off()\n- 退出：disable_wifi_beacon → net_set_power_save(false) → lcd_panel_resume() → lcd_brightness_set(app_settings_get_backlight()) → vTaskDelay(20ms 稳定) → 持锁 lcd_touch_discard_pending()（丢弃唤醒那一下的手指）→ lcd_lvgl_pause(false) → 持锁 lv_obj_invalidate(lv_screen_active()) + lv_refr_now(disp) → unlock\n\n根因两条，别只修一半：\n1. 背光“微亮”：LEDC 跑在 APB 时钟上，light sleep 会切时钟，PWM 占空比可能停在错误值。唤醒后要重跑 lcd_brightness_init()（新增的 lcd_panel_resume() 里做，IDF 5.5.5 的 ledc_timer_config/ledc_channel_config 可重复调用，不会报“已初始化”）。\n2. “无 UI”：面板被 DISPOFF 关掉，必须 esp_lcd_panel_disp_on_off(true)；且 LVGL 从暂停恢复后要主动 invalidate + lv_refr_now，不能指望它自己下一拍就重绘。重发 esp_lcd_panel_init() 也安全：IDF 5.5.5 的 ST7789 驱动只发 SLPOUT/MADCTL/COLMOD/RAMCTRL，MADCTL 用驱动保存的 madctl_val，不会丢 swap_xy/mirror。\n\n无 WiFi 时也要能睡：信标唤醒只在 net_is_initialized() && app_wifi_is_connected() 时使能，但 esp_sleep_enable_timer_wakeup() 必须每轮都设；esp_light_sleep_start() 返回错误就 vTaskDelay 兜底并每 10 次重试一次，别永久放弃。\n\n什么时候该想起它：改这个工程的省电/休眠、或用户反馈“唤醒后黑屏/微亮/界面不动/没网不睡”时。\n",
+      "change": "added",
+      "at": "2026-10-27 21:17",
+      "history": [
+        {
+          "at": "2026-10-27 21:17",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n3",
+      "parent": "n1",
+      "title": "fullclean 会删掉被跟踪的 managed_components（Windows 文件锁）",
+      "body": "`idf.py fullclean` 在这台 Windows 上会顺带执行 remove_managed_components：\n- 会删掉 `managed_components/lvgl__lvgl` 里**被 git 跟踪的 30 个附加文件**（.devcontainer/、configs/ci/、configs/defconfigs/、demos/benchmark/assets/），重装 managed_components 时不会补回来 → `git status` 多出 30 条 ` D`，污染改动范围。\n- 还可能因文件被其它进程占用抛 `PermissionError: [WinError 32]`，使 fullclean 返回 1（此时 build 目录通常已经删掉了）。\n- 判断是否真的 clean build：看 build 日志是否从 `[1/2062]` 起算，而不是看 fullclean 的退出码。\n\n处理：`git status -- managed_components` 若有删除，执行 `git checkout -- managed_components` 复原；日常改动后只跑 incremental `idf.py build` 就够，不必 fullclean。\n\n什么时候该想起它：准备在这个工程里跑 `idf.py fullclean`，或发现 git status 里冒出大量 managed_components/lvgl__lvgl 的删除时。",
+      "change": "added",
+      "at": "2026-10-27 21:27",
+      "history": [
+        {
+          "at": "2026-10-27 21:27",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n4",
+      "parent": "n1",
+      "title": "唤醒恢复：4KB 栈跑 lv_refr_now 必溢出；LEDC 在 light sleep 的两条告警与正解",
+      "body": "实机串口（用户 m00556）：\n\n    W (34720) ledc: GPIO 42 is not usable, maybe conflict with others\n    W (34721) ledc: the binded timer can't keep alive in sleep\n    I (34721) LCD: 面板已从休眠恢复（重新初始化 + 打开显示 + 重配背光 PWM）\n    ***ERROR*** A stack overflow in task app_power has been detected.\n\n三条结论（t7 已修，见 components/app/app_power.c、components/my_drivers/lcd.c）：\n\n1. 栈：`power_leave_sleep()` 里做“整屏重绘”不要用 `lv_refr_now()` —— LVGL 渲染中文字体+图层在这一路要吃掉 >4KB 栈。app_power 任务栈提到 8192（app_config.h APP_POWER_TASK_STACK），并且恢复路径只 `lv_obj_invalidate(lv_screen_active())`，让 LVGL 自己的 task（lvgl_port 的 task，栈独立）去刷。\n   栈余量取值：`uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)`（xtensa 的 StackType_t = uint8_t，即字节；写法与 app_mem.c:86 一致）。\n\n2. `GPIO 42 is not usable, maybe conflict with others`：ledc.c:816 的 `esp_gpio_reserve()` 发现 GPIO 已被预占。light sleep 后 GPIO 矩阵复位、但 LEDC 侧预占没释放，直接再 `ledc_channel_config()` 必打这条。正解：先 `ledc_stop(LEDC_LOW_SPEED_MODE, LCD_LEDC_CH, 0)`，再 `gpio_reset_pin(GPIO42)`（gpio.c:462-479 内部会 `esp_gpio_revoke`），最后整套 `lcd_brightness_init()` —— 即 lcd.c 的 `lcd_backlight_reinit()`。\n\n3. `the binded timer can't keep alive in sleep`：只有 `LEDC_SLEEP_MODE_KEEP_ALIVE` 才走这条检查（ledc.c:947-955），而 LEDC 的全局时钟在本工程解析成 APB（LEDC_AUTO_CLK），APB 在 light sleep 不能保持供电 → 必然告警。我们的设计本来就“睡前关背光、醒来重建 PWM”，所以用 IDF 默认档 `LEDC_SLEEP_MODE_NO_ALIVE_NO_PD`（ledc.rst:350：“no signal output and LEDC power domain will not be powered down in sleep”），告警自然消失、睡眠功耗也不会更高。\n   注意：`LEDC_SLEEP_MODE_NO_ALIVE_ALLOW_PD` 在不支持 retention 的芯片会返回 ESP_ERR_NOT_SUPPORTED（ledc.c:848-849），别选它。\n\n什么时候该想起它：改这个工程的省电/休眠唤醒路径，或实机串口出现 app_power stack overflow、ledc “GPIO xx is not usable / can't keep alive in sleep” 时。",
+      "change": "added",
+      "at": "2026-10-27 21:34",
+      "history": [
+        {
+          "at": "2026-10-27 21:34",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n5",
+      "parent": "n1",
+      "title": "唤醒后“背光亮但无画面”：先用清屏探测区分通路 vs LVGL，再重绘",
+      "body": "现象：省电唤醒后背光正常、面板 DISPON 已发、串口只有“唤醒恢复完成 / 栈余量”，但屏幕没有内容。两类原因必须先用日志区分，别猜着改：\n\n1) 面板/SPI 数据通路（light sleep 后 GPIO 矩阵被复位、SPI 外设状态可疑）\n   - 在 lcd_panel_resume() 里（init → disp_on → backlight_reinit 之后、调用者开背光之前）加一次整屏填黑：\n     static uint16_t *s_probe_line（320 像素，heap_caps_malloc 优先 MALLOC_CAP_SPIRAM，回退内部 RAM，绝不放栈）；\n     逐行 esp_lcd_panel_draw_bitmap(panel_handle, 0, y, 320, y+1, line)；\n     y==0 与 y==239 各打一条 `清屏探测 %d 行返回 %s`（esp_err_to_name），中间失败只累计，末尾汇总一条。\n   - 这一步同时是“清屏”，顺带解决唤醒后花屏；位置放在开背光之前，用户只看到干净黑屏，看不到逐行填充。\n   - 判读：0/239 行都 ESP_OK → 通路正常，问题在 LVGL 或 DISPON；出现 ESP_ERR_TIMEOUT/INVALID_STATE → 通路断，先试 gpio_config 重配 SPI/DC 脚 + esp_lcd_panel_reset 的“硬重建”。\n\n2) LVGL 从未重绘\n   - 不要在 app_power 任务里 lv_refr_now（4KB 栈必溢出，见 n4）；改成 app 层提供 `app_chat_ui_force_redraw_async()`，内部只 `lv_async_call(cb, NULL)`，cb 里 lv_obj_invalidate(lv_screen_active()) + lv_refr_now(lcd_get_display()) + LOGI —— async 回调在 esp_lvgl_port 的 lv_timer_handler 里执行，天然是 LVGL 任务上下文。\n   - 判读：有“已请求…”没有“LVGL 已在任务上下文强制重绘” → LVGL 任务卡死；两条都有但屏幕黑 → 面板侧。\n\n3) 分层红线：components/my_drivers 不能 `#include \"app_config.h\"`（app 组件不在 my_drivers 依赖列表，直接 fatal error）。诊断开关放 app_config.h，app 层按宏调用 lcd 的公开函数（如 lcd_panel_hard_reinit()），保持 app→my_drivers 单向依赖，不要为省事改 CMakeLists。\n\n什么时候该想起它：改这个工程的省电唤醒路径，或用户说“唤醒后背光亮着但没画面/花屏/界面不动”时。",
+      "change": "added",
+      "at": "2026-10-27 21:51",
+      "history": [
+        {
+          "at": "2026-10-27 21:51",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n6",
+      "parent": "n1",
+      "title": "ESP32-S3 没有 WiFi 信标唤醒：别调用、别刷 WARN，用定时器轮询 + WIFI_PS_MAX_MODEM",
+      "body": "ESP32-S3 上 `esp_sleep_enable_wifi_beacon_wakeup()` 恒返回 ESP_ERR_NOT_SUPPORTED —— 它依赖 `SOC_PM_SUPPORT_BEACON_WAKEUP`，S3 该宏为 0（IDF: components/esp_hw_support/sleep_modes.c:2282-2290 里直接返回）。所以“休眠期间靠信标唤醒维持 WiFi 关联”在 S3 上做不到。\n\n正确写法（app_power.c 里已这么做）：\n- enable/disable 都用编译期守卫 `#if SOC_PM_SUPPORT_BEACON_WAKEUP` 包住，别在运行期调用后打 WARN，否则每睡一次刷一条 `使能 WiFi 信标唤醒失败：ESP_ERR_NOT_SUPPORTED`，看起来像故障。\n- 不支持时：休眠期间靠 `esp_sleep_enable_timer_wakeup()` 周期醒来轮询，WiFi 用 `WIFI_PS_MAX_MODEM`（net_set_power_save(true)）尽量维持关联；init 阶段打一条 LOGI 说明，之后不再提示。\n- 需要 `#include \"soc/soc_caps.h\"` 才能拿到这个宏。\n\n什么时候该想起它：给 ESP32-S3 设计省电/休眠、或串口里出现 `ESP_ERR_NOT_SUPPORTED` 的 WiFi 信标唤醒失败时。",
+      "change": "added",
+      "at": "2026-10-27 21:58",
+      "history": [
+        {
+          "at": "2026-10-27 21:58",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n7",
+      "parent": "n1",
+      "title": "唤醒自检图案要“留时间”：LVGL 一解除暂停就会把面板图案整屏盖掉",
+      "body": "症状：唤醒后反复“看不到自检彩条”，但日志显示 `清屏探测 0/239 行返回 ESP_OK`、`LVGL 已在任务上下文强制重绘`、子对象数=3、背光 100%。\n\n原因不是面板坏，而是顺序：`lcd_probe_fill()` 画完 → 立刻 `lcd_lvgl_pause(false)` + `lv_async_call(强制重绘)`，LVGL 第一帧就把整屏重绘成自己的背景色，人眼在几十 ms 内看不到图案，串口里却样样“成功”。\n\n正解（components/app/app_power.c 的 power_leave_sleep 里）：\n1. resume（panel init → disp_on → backlight_reinit）后，**先把背光开到用户亮度**（背光 0 时画什么都是黑的，这是最容易漏的一步）；\n2. 画图案后用 `vTaskDelay(pdMS_TO_TICKS(APP_POWER_WAKE_PROBE_HOLD_MS))` 停住，期间 LVGL 仍处暂停；\n3. 再做“分解诊断”：例如先 6 色横条停 1.5s → 再整屏纯红停 1.5s → 然后才恢复界面。两段都看得见但恢复后又不对，就把问题锁到 UI/LVGL 内容层，而不是面板/SPI；\n4. 自检期间绝不能 `lcd_lvgl_pause(false)`，否则上面的等待毫无意义。\n\n配套：CS 走 PCA9557（IO0）而不是 SPI 外设 CS，`lcd_panel_new()` 里只拉低一次，之后靠寄存器保持。怀疑 light sleep 把 PCA9557 复位就加一个只读 dump（pca9557.c `pca9557_dump_output()`：读 OUTPUT 0x01 / CONFIG 0x03，打印十六进制 + 位解释 + 与影子值比对，不一致打 WARN）。正常值 OUTPUT=0x04（LCD_CS 选中）、CONFIG=0xF8。\n\n什么时候该想起它：实机“唤醒后界面不对”但日志里 draw/重绘全 OK、或者想加肉眼可见的显示自检图案时。",
+      "change": "added",
+      "at": "2026-10-27 22:08",
+      "history": [
+        {
+          "at": "2026-10-27 22:08",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n8",
+      "parent": "n1",
+      "title": "ESP32-S3 light sleep 会丢 SPI3：唤醒必须拆总线重建面板，并回写 esp_lvgl_port 的 ctx 句柄 + 重挂 flush 回调",
+      "body": "症状：light sleep 唤醒后背光 100%、`esp_lcd_panel_disp_on_off(true)` 返回 OK、`draw_bitmap` 240 行全 ESP_OK，屏幕却停在旧画面（均匀深蓝/全黑）。\n\n根因：ESP32-S3 **没有** `SOC_SPI_SUPPORT_SLEEP_RETENTION`（只有 C6/C5/P4/H2/C61 有）。CPU 掉电时 SPI3 的寄存器/时钟/DMA 状态全丢且不恢复；`draw_bitmap()` 返回 ESP_OK 只是“像素进了本地 DMA 队列”，数据根本没上总线。\n\n正解（components/my_drivers/lcd.c `lcd_panel_recreate_after_sleep()`）：`esp_lcd_panel_del()` → `esp_lcd_panel_io_del()` → `spi_bus_free(BSP_LCD_SPI_NUM)` → `bsp_spi_init()` → 重建 io + panel（含 reset / 拉低 PCA9557 LCD_CS / init / invert / swap / mirror）→ `esp_lcd_panel_disp_on_off(true)` → 下面两步缺一不可。\n\nesp_lvgl_port 独有的两个坑（v2.x，src/lvgl9/esp_lvgl_port_disp.c）：\n1. 显示上下文是私有结构 `lvgl_port_display_ctx_t`，由 `lv_display_set_driver_data(disp, ctx)` 存放（:450），内部一律用 `lv_display_get_driver_data(disp)` 取回；flush 用的是 `ctx->panel_handle`（:758）。重建后必须把新 `io_handle`/`panel_handle` 写回那块内存（前 4 成员顺序：disp_type / io_handle / panel_handle / control_handle），否则 flush 用悬空指针。\n2. `on_color_trans_done`（里面调 `lv_disp_flush_ready`）是注册在 **旧 io_handle** 上的（:123-128）。`esp_lcd_panel_io_del()` 会把它一起删掉 → 必须在新 io 上重挂 `esp_lcd_panel_io_register_event_callbacks(io, cbs, disp)`，否则 LVGL 永远等不到 flush_ready，画面冻结。\n\n调用约束：整个重建必须在 `lcd_lvgl_pause(true)` 期间（LVGL 持锁）做，flush 才不并发；重建不含背光，之后要 `lcd_backlight_reinit()` + `lcd_brightness_set()`（light sleep 同样打乱 LEDC）。\n\n什么时候该想起它：唤醒后“背光正常但画面不动/全黑”、且怀疑 SPI/面板状态丢失时；或要在一个已休眠过的 SPI 屏上重建 esp_lcd 面板句柄时。",
+      "change": "added",
+      "at": "2026-10-27 22:49",
+      "history": [
+        {
+          "at": "2026-10-27 22:49",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n9",
+      "parent": "n1",
+      "title": "唤醒黑屏排查三板斧：flush 计数、背光 duty 回读、重建前后堆快照",
+      "body": "“唤醒后黑屏/深蓝”排查不要一次改十个地方，先量三处，一次就能定性：\n\n1) **flush 回调计数**（`lcd.c` 的 `lcd_flush_ready_cb` 里 `s_flush_done_count++`，导出 `lcd_flush_done_count()`）：唤醒末尾取 before → `lv_async_call` 请求重绘 → **等 150ms**（异步调用只是排队，渲染在 LVGL 任务里）→ 取 after。\n   - 差值 >0：帧已交给 SPI，问题在面板/背光/硬件；\n   - 差值 =0：LVGL 没刷，或 `on_color_trans_done` 没挂上（重挂失败/旧 io 被删）。\n2) **背光 PWM 回读**：`ledc_get_duty(LEDC_LOW_SPEED_MODE, ch)` + `ledc_get_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0)`。若“代码设了 60%”而回读 duty=0，则背光实际是灭的 —— 用户看到的“深蓝色”只是面板残留影像，根本不是我们画的图案。\n3) **重建前后堆快照**：`esp_get_free_heap_size()` / `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)` / `(MALLOC_CAP_DMA)`。每次唤醒内部堆或 DMA 堆掉几 KB ⇒ 重复重建在泄漏（SPI 设备结构体、DMA 描述符）。\n\n两个已验证的事实，别再重复查：\n- `esp_lcd_panel_io_del()` 自带排空：按 `num_trans_inflight` 逐个 `spi_device_get_trans_result(portMAX_DELAY)` 再 `spi_bus_remove_device`（esp_lcd_panel_io_spi.c:148-154），所以重建前不需要自己等总线空闲。\n- `pca9557_set_output()` **无条件写** I2C（不打“影子相同就跳过”的短路径），所以 LCD_CS 不会因为影子值卡住；要查 CS 直接看 `pca9557_dump_output()` 的 OUTPUT 位。\n\n什么时候该想起它：实机出现“唤醒后背光亮/不亮但没画面、第一次好之后都坏”，需要在不瞎改代码的前提下把“LVGL 没刷 / 帧没出 SPI / 背光没真开 / 重建泄漏”四者分开时。",
+      "change": "added",
+      "at": "2026-10-27 23:01",
+      "history": [
+        {
+          "at": "2026-10-27 23:01",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n10",
+      "parent": "n9",
+      "title": "唤醒黑屏第四步：用“LEDC / GPIO 直驱低 / GPIO 直驱高”三通道对照，把“背光没真开”与“面板没收到内容”分开",
+      "body": "看到“ESP32-S3 唤醒后屏幕全黑”时，先别把锅扣给 SPI/LVGL —— flush 计数 proves 传输完成，不代表背光在亮。用**肉眼可分辨的三通道对照**定性：\n\n1) 先铺白底：`lcd_set_color(0xFFFF)`（黑屏下“背光亮”和“背光灭”肉眼几乎无差别，这是整招的前提）；\n2) A = LEDC 100%（`lcd_brightness_set(100)` + `ledc_get_duty/ledc_get_freq` 回读，只能证明寄存器不是波形）；\n3) B = GPIO 直驱低电平：`ledc_stop(mode, ch, 1)` → `gpio_reset_pin(BSP_LCD_BACKLIGHT)` → `gpio_set_direction(OUTPUT)` → `gpio_set_level(42, 0)`（低电平点亮 → 最亮）；\n4) C = 同一路 `gpio_set_level(42, 1)`（应全黑）；\n5) D = `lcd_backlight_reinit()` + `lcd_brightness_set(100)` 恢复 LEDC（GPIO 直驱会拆掉 PWM 绑定，必须重建）。\n每段停 1.2s，日志带 [1/4]…[4/4]。\n\n判读：A亮B亮C灭 → 背光/LEDC 都正常，问题在面板是否真的收到像素（查 LCD_CS/DC/面板供电）；A灭B亮 → light sleep 后 LEDC 到引脚的路由失效，正解是背光别走 LEDC（GPIO 直驱常亮）或换 `LEDC_USE_RC_FAST_CLK`；A灭B灭 → 硬件（升压/面板 VCC/排线），软件到头；C 也亮 → `gpio_set_level` 没生效（引脚仍被别的外设 reserve）。\n\n配套的版本横幅（`build-N`）+ 每次唤醒开始/结束分隔线 + 一行汇总（第 N 次 | 内部堆 | DMA 堆 | flush 差值 | 背光 duty），让用户只贴一条就能定位是哪一版、哪一轮。\n\n什么时候该想起它：实机“唤醒后亮/不亮但没画面”、flush 计数正常却屏黑，需要在不瞎改代码的前提下把“背光没真开”与“面板没收到内容”分开时。",
+      "change": "added",
+      "at": "2026-10-27 23:12",
+      "history": [
+        {
+          "at": "2026-10-27 23:12",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n11",
+      "parent": "n9",
+      "title": "唤醒黑屏第五步：开机自动 A/B 对照（不睡重建 vs 真 light sleep 后重建）",
+      "body": "排查“唤醒后屏幕不显示”时，最容易混在一起的两个变量是：**我们自己的恢复/重建代码** 和 **light sleep 本身**。用一次开机自动对照实验就能切开，不必让用户等 30s 休眠。\n\n做法（build-6 实测采用的版本）：\n1. 加 `APP_POWER_SIMULATE_WAKE_TEST 1`，在 `app_power_task()` 循环前 `vTaskDelay(10000)` 后跑一次 `power_simulate_wake_test()`（`s_sim_done` 保证只跑一次）。\n2. **A 段（不睡）**：`lcd_lvgl_pause(true)` → `lcd_backlight_off()` → `lcd_panel_display_on(false)` → 500ms → 重建（\"拆 SPI3 总线 + 重建面板\"那条路）→ `lcd_backlight_reinit()` + `lcd_backlight_set_duty_raw(1023)` → `lcd_set_color(0xF800)` 整屏红 → 2.5s。\n3. **B 段（真睡 300ms）**：DISPOFF+关背光 → 50ms → `esp_sleep_enable_timer_wakeup(300ms)` + `esp_light_sleep_start()` → 同一套重建 → `set_duty_raw(1023)` + `lcd_set_color(0x07E0)` 整屏绿 → 2.5s。\n4. 收尾 DISPON → 恢复亮度 → `lcd_lvgl_pause(false)` → `lvgl_port_lock` 内 `lv_async_call` 强制重绘；并把 `s_sim_done` 置位，唤醒自检段据此跳过彩条/红屏（否则实验颜色会被自检图案盖掉）。\n\n判读（A 是否红 / B 是否绿）：\n- A 红、B 绿 / A 红、B 不绿 → 重建代码无辜，light sleep 本身毁掉面板或 SPI（哪怕只睡 300ms）→ 查面板 VCC / PCA9557 是否在睡眠期间掉电，考虑换 SPI 外设或硬复位；\n- A 不红、B 不绿 → 是我们“拆总线重建”把面板弄死 → 改成只 `esp_lcd_panel_init()`+DISPON、保留同一 io/panel 句柄；\n- A 不红、B 绿 → 拆总线时序竞争 → 加延时/重试并打印 `bsp_spi_init()` 返回值；\n- 都不是红/绿 → 怀疑“清屏探测 240 行 ESP_OK”假成功（DMA 队列满也返回 OK），改读面板 ID（0x04/0xDA）验证命令通路。\n\n关键前提：`lcd_set_color()` 直接写面板，不经 LVGL，所以颜色结论只反映“SPI/面板通路 + 背光”，不受 LVGL 状态干扰。\n\n什么时候该想起它：要在 ESP32 上分辨“唤醒黑屏是我的恢复代码还是 light sleep 造成”的时候，直接照这个 A/B 开机自测做，比让用户反复等超时快得多。",
+      "change": "added",
+      "at": "2026-10-27 23:29",
+      "history": [
+        {
+          "at": "2026-10-27 23:29",
+          "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+        }
+      ],
+      "by": "5e78eb14-07c2-4810-a41c-ec165c8581dd"
+    },
+    {
+      "id": "n12",
+      "parent": "n8",
+      "title": "最终结论：这个板子的省电只能做“软省电”（降背光+WiFi 省电档+屏蔽录音键），light sleep 走不通",
+      "body": "## 一行结论\nESP32-S3 + 这块 ST7789 SPI 屏，**任何 light sleep 方案都保不住画面**（S3 无 SPI sleep retention，唤醒后拆总线重建面板会把面板弄死）；最终采用**软省电**：不进 light sleep、不碰 SPI/面板句柄，只降背光 + WiFi 最大省电档 + 屏蔽录音键。\n\n## 证据链（按顺序，别再重走）\n1. light sleep 唤醒后 `draw_bitmap` 全返回 `ESP_OK`，但屏停在旧画面（均匀深蓝）→ 像素只进了本地 DMA 队列，SPI 外设没往总线发（S3 的 `SOC_SPI_SUPPORT_SLEEP_RETENTION` 不存在，`spi_common.c:807` 的 retention 分支编不进来）。\n2. 改成唤醒后 `esp_lcd_panel_del` + `esp_lcd_panel_io_del` + `spi_bus_free` + 重建 + 回写 `lv_display_get_driver_data()` 的 ctx 句柄 + 重挂 flush 回调 → **第一次唤醒能用**，之后又变深蓝。\n3. build-6 做了开机 A/B 对照（A=不睡只重建，B=真 light sleep 后重建）：**A 也画不出红屏**，全程只有亮度一点差别 ⇒ 凶手是**拆总线重建本身**，不是 light sleep。\n4. flush 计数证明 LVGL 整帧确实调用了 flush；背光 duty 回读、GPIO 直驱/浮空对照证明背光链路正常 ⇒ 只剩“面板不接收数据”。\n\n## 现在的实现（build-8，可交付）\n- `components/app/app_power.c`：20/50ms 轮询 QMI8658（相邻帧 ACC 差 + |gyro| 和，阈值由设置页弱/中/强三档决定）+ `lcd_touch_pressed()` + 按键；空闲 ≥ 超时（30s/1min/永不）→ `power_enter_soft_sleep()`：`lcd_brightness_set(APP_LCD_BRIGHTNESS_MIN)`(5%) + `net_set_power_save(true)`；触摸/IMU/按键 → `power_leave_soft_sleep()`：背光回 `app_settings_get_backlight()` + `net_set_power_save(false)`。\n- **唤醒闩锁**：`static volatile bool s_wake_req`，`app_power_notify_activity()` 置位，省电分支 `wake = s_wake_req || active`，入睡/init 清位；`APP_POWER_SLEEP_POLL_MS=20`。否则 100ms 快按会整段落在两次轮询之间丢掉。\n- `app_bus` 新增 `ui_page` 标志（设置页）与 `ui_modal`（弹窗）分离：`app_key.c` 拦 `modal || page` 都不录音，但 `power_can_sleep()` 只看 `modal` —— 所以**停在设置页也会省电**。\n- 诊断脚手架（彩条/红屏/亮度阶梯/A-B 对照/`pca9557_dump_output`/`lcd_probe_fill`/`lcd_panel_recreate_after_sleep` 等）已全部删除；`lcd.c` 1087→487 行、`lcd.h` 313→129 行。\n\n## 教训\n- 不要用“日志说 OK”判断 SPI 写屏成功：`esp_lcd_panel_draw_bitmap` 返回 `ESP_OK` 只代表进队列。\n- 判断“背光没真开”还是“面板没收到”：读 LEDC duty + GPIO 直驱/悬空对照，比反复改代码快。\n- 判断“light sleep 的锅”还是“我代码的锅”：加一个**不睡也走同样重建路径**的开机 A/B，一次就分开。\n- 这块板 LCD_CS 在 PCA9557（IO0，低有效）上，SPI 的 CS 引脚是 NC；排障时先 dump 它的输出寄存器。\n\n什么时候该想起它：这个工程再提“休眠/省电/唤醒后黑屏”，或想在别的 ESP32-S3 板子上做“静止自动熄屏”时——先确认能不能不碰 SPI 就达到省电目标。",
+      "change": "added",
+      "at": "2026-10-27 23:49",
+      "history": [
+        {
+          "at": "2026-10-27 23:49",
+          "by": "session-f5a4a341-1962-44c5-bbd2-a58ede5545aa"
+        }
+      ],
+      "by": "session-f5a4a341-1962-44c5-bbd2-a58ede5545aa"
+    }
+  ],
+  "links": []
+}

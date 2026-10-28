@@ -61,6 +61,11 @@ void net_set_auto_reconnect(bool enable)
     bsp_wifi_set_auto_reconnect(enable);
 }
 
+esp_err_t net_set_power_save(bool enable)
+{
+    return bsp_wifi_set_power_save(enable);
+}
+
 /* ============================ 扫描 ============================ */
 
 int net_scan(net_ap_info_t *buffer, uint16_t max_count)

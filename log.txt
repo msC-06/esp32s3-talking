@@ -1,0 +1,78 @@
+I (34492) bsp_wifi: WiFi 省电模式：MAX_MODEM（省电）
+I (34497) APP_PWR: WiFi 已切到最大省电档（保持连接）
+I (34503) APP_PWR: 本芯片   支持信标唤醒：WiFi 已连接，休眠期间   定时器轮询 + 最  省电档维持关联
+I (34670) wifi:bcn_timeout,ap_probe_send_start
+I (34754) wifi:ap_probe_send over, reset wifi status to disassoc
+I (34754) wifi:state: run -> init (0xc800)
+I (34754) wifi:pm stop, total sleep time: 11348965 us / 23199373 us
+
+I (34761) wifi:<ba-del>idx:0, tid:0
+W (34768) bsp_wifi: 与 AP 断开连接，reason=200
+I (34950) APP_PWR: ========== 第 1 次唤醒：开始恢复 ==========
+I (34951) APP_PWR: 检测到唤醒（第 1 次唤醒；touch；上一轮 light sleep 唤醒源 timer），退出省电模式：恢复面板/背光/界面
+I (34959) wifi:Set ps type: 1, coexist: 0
+
+I (34963) bsp_wifi: WiFi 省电模式：MIN_MODEM（默认）
+I (34969) APP_PWR: WiFi 已恢复默认功耗档
+I (34973) APP_PWR: 内存快照（重建前）：总空闲 6319991 B，内部堆空闲 64787 B，DMA 堆空闲 57087 B
+I (34983) LCD: 唤醒重建：拆掉旧面板/IO/SPI3 总线（light sleep 后 SPI 无 retention，寄存器与 DMA 状态已丢失）
+I (34995) bsp_spi: SPI bus initialized
+I (35119) LCD: ST7789 初始化完成（320x240）
+I (35120) LCD: 唤醒重建：LVGL 上下文句柄已回写（io=0x3fcebd44 panel=0x3fcec368）
+I (35121) LCD: 唤醒重建完成：SPI3 总线 + 面板 IO + ST7789 全部重建，flush 回调已重新注册
+I (35131) APP_PWR: 内存快照（重建后）：总空闲 6319963 B，内部堆空闲 64759 B，DMA 堆空闲 57059 B
+I (35142) LCD: 背光回读（backlight_reinit 之后）：duty=0/1023（0%），freq=5000Hz
+I (35150) LCD: 清屏探测行缓冲就绪（320 像素，640 字节）
+I (35156) LCD: 清屏探测 0 行返回 ESP_OK
+I (35212) LCD: 清屏探测 239 行返回 ESP_OK
+I (35213) LCD: 清屏探测完成：240 行全部成功（SPI/面板数据通路正常）
+I (35327) LCD: 背光回读（brightness_set）：duty=0/1023（0%），freq=5000Hz
+I (35327) APP_PWR: [1/4] 背光测试 A：LEDC 100%（duty=1023/1023，freq=5000Hz，设置返回 ESP_OK）
+I (36251) APP_WIFI: 界面 WiFi 状态 -> 「WiFi未连接」
+I (36533) LCD: 背光已切到 GPIO 直驱：点亮（GPIO42=0）
+I (36533) APP_PWR: [2/4] 背光测试 B：GPIO42 直驱低电平（应最亮，返回 ESP_OK）
+I (37736) LCD: 背光已切到 GPIO 直驱：熄灭（GPIO42=1）
+I (37736) APP_PWR: [3/4] 背光测试 C：GPIO42 直驱高电平（应全黑，返回 ESP_OK）
+W (37772) bsp_wifi: 自动重连中（第 1 次）...
+I (38939) LCD: 背光回读（backlight_reinit 之后）：duty=1023/1023（100%），freq=5000Hz
+I (38940) LCD: 背光回读（brightness_set）：duty=0/1023（0%），freq=5000Hz
+I (38944) APP_PWR: [4/4] 背光测试 D：恢复 LEDC 100%（reinit=ESP_OK，set=ESP_OK）
+I (38952) APP_PWR: 自检阶段 1：显式重新拉低 LCD_CS（PCA9557 IO0=0）并 dump 输出寄存器
+I (38962) APP_PWR: 自检阶段 1：pca9557_lcd_cs(0) 返回 ESP_OK
+I (38968) pca9557: PCA9557 dump：OUTPUT(0x01)=0x04 CONFIG(0x03)=0xF8 影子=0x04
+I (38975) pca9557: PCA9557 位解释：LCD_CS=0（低=选中，正常） PA_EN=0 DVP_PWDN=1 | IO0..IO2 方向=全输出
+I (38985) LCD: 背光回读（brightness_set）：duty=1023/1023（100%），freq=5000Hz
+I (38993) APP_PWR: 自检阶段 1：背光已提前设置为 100%（否则自检图案不可见）
+I (39002) APP_PWR: 自检阶段 2：画 6 色横条（红/绿/蓝/白/灰/黑）
+I (39009) LCD: 清屏探测 0 行返回 ESP_OK
+I (39065) LCD: 清屏探测 239 行返回 ESP_OK
+I (39066) LCD: 清屏探测完成：240 行全部成功（SPI/面板数据通路正常），已画彩色横条
+I (39068) LCD: 自检横条 1/6：颜色 0xF800，第 0..39 行
+I (39074) LCD: 自检横条 2/6：颜色 0x07E0，第 40..79 行
+I (39080) LCD: 自检横条 3/6：颜色 0x001F，第 80..119 行
+I (39086) LCD: 自检横条 4/6：颜色 0xFFFF，第 120..159 行
+I (39092) LCD: 自检横条 5/6：颜色 0x8410，第 160..199 行
+I (39097) LCD: 自检横条 6/6：颜色 0x0000，第 200..239 行
+I (40177) wifi:state: init -> auth (0xb0)
+I (40188) wifi:state: auth -> assoc (0x0)
+I (40633) APP_PWR: 自检阶段 3：画整屏纯红（0xF800）
+I (40633) LCD: 清屏探测 0 行返回 ESP_OK
+I (40686) LCD: 清屏探测 239 行返回 ESP_OK
+I (40686) LCD: 清屏探测完成：240 行全部成功（SPI/面板数据通路正常），已画彩色横条
+I (40689) LCD: 自检横条 1/1：颜色 0xF800，第 0..239 行
+W (40772) bsp_wifi: 自动重连中（第 2 次）...
+E (40772) wifi:sta is connecting, return error
+E (40772) bsp_wifi: esp_wifi_connect 失败: ESP_ERR_WIFI_CONN
+I (41188) wifi:state: assoc -> init (0x400)
+W (41189) bsp_wifi: 与 AP 断开连接，reason=4
+I (42225) APP_PWR: 自检阶段 4：自检图案结束，开始恢复背光/界面
+I (42225) LCD: 背光回读（brightness_set）：duty=1023/1023（100%），freq=5000Hz
+I (42229) APP_PWR: 唤醒后背光已设置为 100%
+I (42261) APP_PWR: 已请求 LVGL 在任务上下文强制重绘（lv_async_call）
+I (42262) APP_UI: LVGL 已在任务上下文强制重绘（screen=0x3fcae184）
+I (42264) APP_UI: 唤醒重绘检查：screen=0x3fcae184 子对象数=3 显示对象=0x3fcacef4
+I (42301) APP_UI: LVGL 强制刷新完成（lv_refr_now）
+I (42411) APP_PWR: 第 1 次唤醒 flush 回调次数 before=960 after=973（差值 13，帧已交给 SPI，问题在面板/背光/硬件）
+I (42412) APP_PWR: 唤醒恢复完成，app_power 栈余量 5956 字节
+I (42419) APP_PWR: 唤醒汇总：第 1 次 | 内部堆 64743 B | DMA 堆 57043 B | flush 差值 13 | 背光 duty 1023/1023
+I (42430) APP_PWR: ========== 第 1 次唤醒：恢复结束 ==========

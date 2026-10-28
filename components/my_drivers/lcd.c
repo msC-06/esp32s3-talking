@@ -21,6 +21,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_io.h"
 #include "esp_lcd_touch_ft5x06.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
@@ -75,7 +76,14 @@ esp_err_t lcd_brightness_init(void)
         .timer_sel  = 0,
         .duty       = 0,
         .hpoint     = 0,
-        .sleep_mode = LEDC_SLEEP_MODE_KEEP_ALIVE,   /* v5.4+ 新增 */
+        /* 用 IDF 的默认档 NO_ALIVE_NO_PD（官方文档 ledc.rst:350：
+         * “no signal output and LEDC power domain will not be powered down in sleep”）。
+         * 本工程走“软省电”（不进 light sleep、只把背光调到最小），开机路径一次配置后
+         * 不再重建 PWM；若改回 LEDC_SLEEP_MODE_KEEP_ALIVE，在这颗芯片上会告警：
+         * LEDC 的全局时钟是 APB（LEDC_AUTO_CLK 在本工程解析成 APB），APB 在 light sleep
+         * 期间不能保持供电，驱动会打 "the binded timer can't keep alive in sleep"
+         * （ledc.c:947-955），而且 KEEP_ALIVE 还要额外保住时钟源/电源域，睡眠功耗反而更高。 */
+        .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
         .flags.output_invert = true,                /* 背光低电平点亮 */
     };
     const ledc_timer_config_t backlight_timer = {
@@ -112,11 +120,15 @@ esp_err_t lcd_backlight_on(void)  { return lcd_brightness_set(100); }
 /* ============================================================
  *  液晶屏驱动（SPI 总线由 bsp_spi_init 负责）
  * ============================================================ */
-esp_err_t lcd_panel_new(void)
+
+/* 只创建并初始化 io_handle / panel_handle（含 reset + CS 拉低 + init + 反色/交换/镜像）。
+ *
+ * 不碰背光（那是 lcd_brightness_init 的事），不碰 LVGL，也不发 DISPON：
+ * 开机路径 lcd_panel_new() = 背光 + 本函数，只跑一次（软省电不重建面板）。
+ */
+static esp_err_t lcd_create_panel_io(void)
 {
     esp_err_t ret = ESP_OK;
-
-    ESP_RETURN_ON_ERROR(lcd_brightness_init(), TAG, "背光初始化失败");
 
     /* ---- Panel IO ---- */
     const esp_lcd_panel_io_spi_config_t io_config = {
@@ -159,6 +171,13 @@ err:
     if (panel_handle) { esp_lcd_panel_del(panel_handle);    panel_handle = NULL; }
     if (io_handle)    { esp_lcd_panel_io_del(io_handle);    io_handle    = NULL; }
     return ret;
+}
+
+/* 开机路径：初始化背光 PWM + 创建并初始化面板（对外行为与改动前一致） */
+esp_err_t lcd_panel_new(void)
+{
+    ESP_RETURN_ON_ERROR(lcd_brightness_init(), TAG, "背光初始化失败");
+    return lcd_create_panel_io();
 }
 
 /* ============================================================
@@ -362,6 +381,26 @@ esp_err_t lcd_touch_new(esp_lcd_touch_handle_t *ret_touch)
     };
 
     return esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, ret_touch);
+}
+
+bool lcd_touch_pressed(void)
+{
+    if (tp == NULL) {
+        return false;
+    }
+
+    /* 读一次触摸芯片（I2C），失败就当“没有触摸”，别影响低功耗主循环 */
+    if (esp_lcd_touch_read_data(tp) != ESP_OK) {
+        return false;
+    }
+
+    uint16_t x     = 0;
+    uint16_t y     = 0;
+    uint8_t  count = 0;
+    if (!esp_lcd_touch_get_coordinates(tp, &x, &y, NULL, &count, 1)) {
+        return false;
+    }
+    return (count > 0);
 }
 
 static lv_indev_t *lcd_display_indev_init(lv_disp_t *disp)

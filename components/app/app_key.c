@@ -8,6 +8,7 @@
 #include "app_key.h"
 #include "app_bus.h"
 #include "app_config.h"
+#include "app_power.h"          /* 软省电期间屏蔽录音键（按键只当唤醒） */
 #include "app_wifi.h"           /* 按下录音键前先看 WiFi 连没连（未连接就不录音、不上传） */
 
 #include "bsp/bsp_gpio.h"
@@ -258,8 +259,19 @@ void app_key_task(void *arg)
 
             switch (key_ev) {
             case APP_KEY_EVENT_PRESS:
-                if (app_bus_is_ui_modal()) {
-                    /* 界面上正开着弹窗（背光设置 / WiFi 列表 / 输密码），
+                /*
+                 * 软省电中：录音键被屏蔽。
+                 * 此时用户按下去的本意几乎一定是“把屏幕弄亮/叫醒设备”，
+                 * 所以只刷新一次活动时间（让低功耗任务立刻退出软省电），
+                 * 不录音、不弹窗、不改状态机。
+                 */
+                if (app_power_is_sleeping()) {
+                    app_power_notify_activity();
+                    ESP_LOGI(TAG, "软省电中：录音键已屏蔽，本次按键只用于唤醒");
+                    break;
+                }
+                if (app_bus_is_ui_modal() || app_bus_is_ui_page()) {
+                    /* 界面上正开着弹窗（背光设置 / WiFi 列表 / 输密码）或设置二级页，
                      * 这时按录音键一定是误触：屏幕上正输密码呢，别冒出“录音中...” */
                     ESP_LOGW(TAG, "界面弹窗打开中，忽略这次按下");
                     break;

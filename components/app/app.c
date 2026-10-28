@@ -14,6 +14,7 @@
 #include "app_net.h"
 #include "app_chat_ui.h"
 #include "app_mem.h"
+#include "app_power.h"
 #include "app_settings.h"
 #include "app_time.h"
 
@@ -133,6 +134,15 @@ esp_err_t app_start(void)
         ESP_LOGW(TAG, "时间模块启动失败，界面不显示时间、AI 也不知道当前日期");
     }
 
+    /* ---------- 6.6 低功耗（IMU + 触摸静止检测）----------
+     * 必须在 app_settings_init() 之后（要读用户选的休眠时间），
+     * 也必须在界面建好之后：省电时只降背光 + WiFi 省电 + 屏蔽录音键，
+     * 不碰面板/SPI/LVGL（早先“关屏 + light sleep”的方案会让 ST7789 醒不过来）。
+     * 这里只是初始化状态，真正的轮询在 app_power_task 里。 */
+    if (app_power_init() != ESP_OK) {
+        ESP_LOGW(TAG, "低功耗模块初始化异常，自动休眠可能不可用");
+    }
+
     /* ---------- 7. 创建四个任务（双核绑定） ---------- */
     esp_err_t task_err = ESP_OK;
 
@@ -154,6 +164,10 @@ esp_err_t app_start(void)
                     APP_KEY_TASK_STACK,   APP_KEY_TASK_PRIO,   APP_CPU_APP_CORE);
     APP_CREATE_TASK(app_audio_task, "app_audio",
                     APP_AUDIO_TASK_STACK, APP_AUDIO_TASK_PRIO, APP_CPU_APP_CORE);
+
+    /* 低功耗轮询（同应用核，最低优先级：只在没人用时才采样/休眠） */
+    APP_CREATE_TASK(app_power_task, "app_power",
+                    APP_POWER_TASK_STACK, APP_POWER_TASK_PRIO, APP_POWER_TASK_CORE);
 
 #undef APP_CREATE_TASK
 

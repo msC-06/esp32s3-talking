@@ -37,6 +37,10 @@ static volatile bool s_ui_typing = false;
 /** 界面上是否有模态弹窗（写者：LVGL 任务；读者：状态机） */
 static volatile bool s_ui_modal = false;
 
+/** 是否停在二级页（设置页）。与“弹窗”分开：二级页只屏蔽录音键，
+ *  不阻止自动省电（用户停设置页走开，屏幕一样该暗下来）。 */
+static volatile bool s_ui_page = false;
+
 /* ============================ 发送暂存区 ============================ */
 /*
  * 为什么不用局部变量发消息：
@@ -141,6 +145,7 @@ esp_err_t app_bus_init(void)
     s_state     = APP_STATE_IDLE;
     s_ui_typing = false;
     s_ui_modal  = false;
+    s_ui_page   = false;
     ESP_LOGI(TAG, "队列就绪：key=%d audio=%d pcm=%d asr=%d llm=%d chat=%d ui=%d",
              APP_KEY_QUEUE_LEN, APP_AUDIO_QUEUE_LEN, APP_PCM_QUEUE_LEN,
              APP_ASR_QUEUE_LEN, APP_LLM_QUEUE_LEN, APP_CHAT_QUEUE_LEN, APP_UI_QUEUE_LEN);
@@ -209,6 +214,21 @@ void app_bus_set_ui_modal(bool open)
 bool app_bus_is_ui_modal(void)
 {
     return s_ui_modal;
+}
+
+/* ============================ 二级页（设置页） ============================ */
+
+void app_bus_set_ui_page(bool open)
+{
+    if (s_ui_page != open) {
+        ESP_LOGI(TAG, "界面二级页: %s", open ? "打开（录音键暂停响应，仍可自动省电）" : "关闭");
+    }
+    s_ui_page = open;
+}
+
+bool app_bus_is_ui_page(void)
+{
+    return s_ui_page;
 }
 
 /* ============================ 投递接口 ============================ */

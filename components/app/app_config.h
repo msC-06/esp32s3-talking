@@ -482,4 +482,79 @@
 /** 连接成功后隔多久自动关掉弹窗（毫秒） */
 #define APP_WIFI_UI_CLOSE_DELAY_MS      1500
 
+/* ============================================================
+ *  14. 低功耗 / 自动省电（app_power.c：IMU + 触摸静止检测）
+ *
+ *  行为（“软省电”方案：不进 light sleep、不碰面板/SPI/LVGL）：
+ *    1. 一直读取板载 IMU（QMI8658）加速度/角速度，并轮询触摸屏；
+ *    2. “长时间静止且没有触摸”超过用户在【设置】里选的时长（30 秒 / 1 分钟 / 永不）
+ *       -> 进入软省电：背光降到最小、WiFi 切最大省电档、屏蔽录音键；
+ *    3. 省电期间一旦 触摸 / IMU 超过阈值 / 按键按下 -> 立刻恢复
+ *       （背光回用户亮度、录音键解禁、WiFi 回默认功耗档）。
+ *
+ *  为什么不用 light sleep：ESP32-S3 没有 SPI retention，这块板的 ST7789 在
+ *  light sleep 之后不再响应任何命令（SLPIN/SLPOUT/DISPON/整屏填色都没反应），
+ *  “关屏 + 拆 SPI3 总线重建”那条路实机验证会把面板弄死，已放弃。
+ * ============================================================ */
+
+/** 是否启用自动省电（0 = 完全不启用，行为与旧固件一致；app_power_task 会直接退出） */
+#define APP_POWER_ENABLE                 1
+
+/** 任务优先级 / 栈 / 核（低优先级轮询，放应用核，别抢音频和界面）
+ *  栈 8192：这条路径要走 I2C 触摸读取 + IMU 读取 + LVGL 锁；
+ *  4096 时实机报过 "A stack overflow in task app_power"（当时的唤醒恢复路径里
+ *  还有 LVGL 整屏渲染），故加倍保留余量。 */
+#define APP_POWER_TASK_PRIO              2
+#define APP_POWER_TASK_STACK             8192
+#define APP_POWER_TASK_CORE              APP_CPU_APP_CORE
+
+/** 正常模式下多久采一次 IMU + 触摸（毫秒） */
+#define APP_POWER_SAMPLE_MS              50
+
+/** 软省电模式下多久醒一次检查唤醒源（毫秒）。
+ *  软省电只降背光、CPU 照常跑，所以轮询代价可以忽略；20 ms 保证
+ *  “轻点一下屏幕/快按一下键”也能在下一拍被采到（再配 app_power 里的
+ *  s_wake_req 闩锁，落在两次采样之间的操作也不会丢）。 */
+#define APP_POWER_SLEEP_POLL_MS          20
+
+/* ---------- IMU 唤醒灵敏度（设置页“弱 / 中 / 强”三档） ----------
+ * 判据和下面“静止判定”是同一套：相邻两次采样的加速度 L1 差（单位 g）
+ * 或三轴角速度绝对值之和（单位 °/s）超过阈值就算“动了一下”，触发唤醒。
+ * 三档只是换阈值，触摸唤醒不受档位影响（任何触摸都直接唤醒）。 */
+
+/** 档位编号（同时是 NVS 里存的值：0 = 弱，1 = 中，2 = 强） */
+#define APP_POWER_IMU_SENS_WEAK          0u
+#define APP_POWER_IMU_SENS_MED           1u
+#define APP_POWER_IMU_SENS_STRONG        2u
+#define APP_POWER_IMU_SENS_COUNT         3u
+
+/** 默认档：中（和老固件的行为一致） */
+#define APP_POWER_IMU_SENS_DEFAULT       APP_POWER_IMU_SENS_MED
+
+/** 加速度唤醒阈值（单位 g，芯片 ±4g 档；越大越“钝”） */
+#define APP_POWER_IMU_ACC_G_WEAK         0.10f
+#define APP_POWER_IMU_ACC_G_MED          0.30f
+#define APP_POWER_IMU_ACC_G_STRONG       0.60f
+
+/** 角速度唤醒阈值（单位 °/s，芯片 ±512dps 档；三轴绝对值之和） */
+#define APP_POWER_IMU_GYRO_DPS_WEAK      8.0f
+#define APP_POWER_IMU_GYRO_DPS_MED       16.0f
+#define APP_POWER_IMU_GYRO_DPS_STRONG    32.0f
+
+/** 兼容旧名字：这两个宏就等于“中档”阈值（不要另外定义一套数值） */
+#define APP_POWER_MOTION_ACC_G           APP_POWER_IMU_ACC_G_MED
+#define APP_POWER_MOTION_GYRO_DPS        APP_POWER_IMU_GYRO_DPS_MED
+
+/** 休眠超时选项（0 = 永不自动休眠） */
+#define APP_POWER_TIMEOUT_NEVER          0u
+#define APP_POWER_TIMEOUT_30S            30000u
+#define APP_POWER_TIMEOUT_60S            60000u
+#define APP_POWER_TIMEOUT_DEFAULT_MS     APP_POWER_TIMEOUT_30S
+
+/** 休眠超时在 NVS 里的键名（和背光同属 chatset 命名空间） */
+#define APP_SETTINGS_NVS_KEY_SLEEP_MS    "sleep_ms"
+
+/** IMU 唤醒灵敏度档位在 NVS 里的键名（0/1/2，见 APP_POWER_IMU_SENS_*） */
+#define APP_SETTINGS_NVS_KEY_IMU_SENS    "imu_sens"
+
 #endif /* __APP_CONFIG_H */

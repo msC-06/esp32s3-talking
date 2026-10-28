@@ -69,6 +69,13 @@ bool net_is_connected(void);
 /** 是否开启断线自动重连（默认开） */
 void net_set_auto_reconnect(bool enable);
 
+/**
+ * @brief  切换 WiFi 省电等级（自动休眠省电时用）
+ * @param  enable true = 最大省电（保持连接，延迟变大）；false = 默认
+ * @return ESP_OK 已生效；ESP_ERR_INVALID_STATE 网络还没初始化
+ */
+esp_err_t net_set_power_save(bool enable);
+
 /* ============================ 扫描 ============================ */
 
 /**

@@ -519,6 +519,24 @@ void bsp_wifi_set_connect_timeout(uint32_t timeout_ms)
     s_connect_timeout_ms = (timeout_ms == 0) ? BSP_WIFI_CONNECT_TIMEOUT_MS : timeout_ms;
 }
 
+esp_err_t bsp_wifi_set_power_save(bool enable)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* MIN_MODEM 是开机时的默认档；省电时切到 MAX_MODEM（只在 DTIM 醒来） */
+    wifi_ps_type_t ps  = enable ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM;
+    esp_err_t      err = esp_wifi_set_ps(ps);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "切换 WiFi 省电模式失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "WiFi 省电模式：%s", enable ? "MAX_MODEM（省电）" : "MIN_MODEM（默认）");
+    return ESP_OK;
+}
+
 /* ============================ 扫描 ============================ */
 
 int bsp_wifi_scan(bsp_wifi_ap_info_t *buffer, uint16_t max_count)

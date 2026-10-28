@@ -105,6 +105,19 @@ bool bsp_wifi_is_connected(void);
 void bsp_wifi_set_auto_reconnect(bool enable);
 
 /**
+ * @brief  切换 WiFi 省电等级（自动休眠省电时用）
+ *
+ * @param  enable true  = 最大省电（WIFI_PS_MAX_MODEM，只在 DTIM 醒来听信标，
+ *                        保持连接但延迟变大）
+ *                false = 默认省电（WIFI_PS_MIN_MODEM，和开机时一致）
+ * @return ESP_OK 已生效；ESP_ERR_INVALID_STATE WiFi 还没初始化
+ *
+ * @note   不会断开连接：STA 仍然保持关联，只是收发变“慢一点”。
+ *         唤醒后要记得调回 false，否则语音上传会明显变慢。
+ */
+esp_err_t bsp_wifi_set_power_save(bool enable);
+
+/**
  * @brief  设置连接超时时间
  */
 void bsp_wifi_set_connect_timeout(uint32_t timeout_ms);
