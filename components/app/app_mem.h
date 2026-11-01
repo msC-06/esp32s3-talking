@@ -45,12 +45,36 @@ esp_err_t app_mem_monitor_init(void);
 void app_mem_log(const char *where);
 
 /**
- * @brief  打印一行精简内存信息（内部堆余量 / 最大块 / PSRAM），用于关键路径打点
+ * @brief  打印一行精简内存信息（内部堆余量 / 最大块 / 内部历史最低 / PSRAM），用于关键路径打点
  *
  * @param  where 触发位置说明，例如 "识别前"、"上传失败"
- * @note   只打一行，适合在请求前后插桩；详细的（含任务栈、LVGL 池）用 app_mem_log()。
+ * @note   只打一行，适合在请求前后插桩；**带历史最低**，相邻两笔的差值就是中间那一段
+ *         吃掉的内部 RAM —— 排查「哪一步把内部堆挤干」时靠它定位。
+ *         详细的（含任务栈、LVGL 池）用 app_mem_log()。
  */
 void app_mem_log_brief(const char *where);
+
+/**
+ * @brief  开始量一段代码的**真实内存峰值**（把内部堆低水位重置到此刻）
+ *
+ * @note   和 app_mem_log_brief() 的区别：brief 报的是“自开机以来”的历史最低，
+ *         它是单调的，事后永远分不清是哪一段造成的；begin/end 一对则只量这两行之间。
+ *         典型用法：
+ *             app_mem_peak_begin();
+ *             xxx_do_network_thing();
+ *             app_mem_peak_end("联网搜索");
+ *         重复 begin 不会嵌套（第二次是空操作）；没 begin 就 end 也安全。
+ */
+void app_mem_peak_begin(void);
+
+/**
+ * @brief  结束本段测量并打印峰值
+ *
+ * @param  where 阶段名，例如 "第1轮请求"、"联网搜索"，只用于日志
+ * @note   打印「内部峰值 x KB（现空闲 y KB，最大块 z KB）」。内部实现里**先读再停**，
+ *         因为 heap_caps_monitor_local_minimum_free_size_stop() 之后低水位会退回开机以来的值。
+ */
+void app_mem_peak_end(const char *where);
 
 #ifdef __cplusplus
 }

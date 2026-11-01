@@ -65,7 +65,11 @@ CONFIG_LWIP_MAX_SOCKETS=10
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
-CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+# 发出方向的分片上限：发出去的请求被切成 2KB 的 TLS 记录就够了，省 2KB 内部堆。
+# （IN 方向仍是 16384 —— 降它会扛不住服务器发来的 16KB 记录，等于拆掉安全网）
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+# 握手完还留着对端证书链没有任何用处（我们不看对端证书），关掉省约 4KB 内部堆/连接
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 
 # 备用 DNS 服务器：DHCP 给的 DNS 偶尔不响应/被劫持，
 # 日志现象是 getaddrinfo() returns 202（= lwip 的 EAI_FAIL，DNS 查询失败），

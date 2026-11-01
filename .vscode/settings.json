@@ -35,5 +35,5 @@
   },
   "idf.portWin": "COM14",
   "idf.flashType": "UART",
-  "idf.port": "COM22"
+  "idf.port": "COM14"
 }

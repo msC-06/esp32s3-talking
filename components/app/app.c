@@ -4,6 +4,7 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "app.h"
 #include "app_config.h"
@@ -25,6 +26,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -55,6 +57,41 @@ static esp_err_t create_task(TaskFunction_t fn, const char *name,
 
 /* ============================ 应用入口 ============================ */
 
+/**
+ * @brief  cJSON 的分配函数：优先落 PSRAM
+ *
+ * @note   为什么值得全局改掉：cJSON 是“整棵树都在堆上”的模型 ——
+ *           · 解析一次 6~7KB 的 Tavily 响应，树 + 各节点字符串约 10~15KB；
+ *           · 拼一次 11.8KB 的追问请求体，树约 12KB。
+ *         这些**全在内部 RAM**（CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384 会把 <16KB 的
+ *         malloc 一律放进内部堆），而它们偏偏和 TLS 会话（一条连接 ~40KB）撞在同一时刻。
+ *         挪到 PSRAM 之后，这段内部开销整个消失，代价只是 PSRAM 里几 KB（那里还剩 6MB）。
+ *
+ * @note   为什么可以全局换、不用担心 free 出错：free() 认的是“指针落在哪个堆区域”，
+ *         它同时认识内部堆和 PSRAM 的指针，所以 cJSON_PrintUnformatted 返回的字符串、
+ *         调用方原有的 free(body)，照旧有效，一行都不用改。
+ *
+ * @note   为什么不用担心并发：app 层所有 cJSON 调用（app_llm / app_web_search / app_http）
+ *         都只跑在同一个 app_net 任务里，天然串行；PSRAM 也不参与 DMA。
+ */
+static void *cjson_psram_malloc(size_t size)
+{
+    void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p == NULL) {
+        p = malloc(size);       /* PSRAM 也满了才退回内部堆，保证不会因此解析失败 */
+    }
+    return p;
+}
+
+static void init_cjson_to_psram(void)
+{
+    cJSON_Hooks hooks = {
+        .malloc_fn = cjson_psram_malloc,
+        .free_fn   = free,      /* free 同时能放内部堆与 PSRAM 的指针，两种来源都安全 */
+    };
+    cJSON_InitHooks(&hooks);
+}
+
 esp_err_t app_start(void)
 {
     ESP_LOGI(TAG, "================ 对话掌机启动 ================");
@@ -74,6 +111,12 @@ esp_err_t app_start(void)
 
     /* ---------- 0.5 内存监控：先注册钩子，第一行日志就是“还没分配大缓冲”的基线 ---------- */
     app_mem_monitor_init();
+
+    /* ---------- 0.6 cJSON 改用 PSRAM ----------
+     * 必须赶在第一次联网（ASR/LLM/搜索）之前，而且越早越好：
+     * 之后每一次 JSON 解析/拼装都少占十来个 KB 内部 RAM（详见函数注释）。 */
+    init_cjson_to_psram();
+    ESP_LOGI(TAG, "cJSON 改用 PSRAM 分配（内部堆少背十几 KB）");
 
     /* ---------- 1. 跨任务队列 ---------- */
     ESP_RETURN_ON_ERROR(app_bus_init(), TAG, "队列初始化失败");

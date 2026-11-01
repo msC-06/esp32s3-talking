@@ -32,6 +32,7 @@
 #include "app_http.h"
 #include "app_time.h"               /* 把当前时间写进 system 提示词 */
 #include "app_web_search.h"
+#include "app_mem.h"                /* 阶段打点：定位内部堆的低水位落在哪一段 */
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -383,13 +384,50 @@ static void llm_add_tools(cJSON *root)
     cJSON_AddItemToArray(tools, tool);
 }
 
+/* ============================ 请求体缓冲（PSRAM） ============================ */
+
+/**
+ * @brief 请求体（JSON 字符串）的静态 PSRAM 缓冲
+ *
+ * 为什么不留在内部堆：请求体从「组好」到「esp_http_client_cleanup」一直有效，
+ * 而这整段时间正是 TLS 握手 + 收发缓冲吃内部堆的时候。留在内部堆就等于
+ * 两份内存叠在同一个峰值上，还顺手制造碎片（mbedTLS 的 in 缓冲要 16KB 连续块）。
+ * 挪到 PSRAM 后，这 ~10KB 完全不参与内部堆竞争 —— 这是「搜索后追问」那一步
+ * 内部堆见底最直接的一处。
+ *
+ * 注意：静态缓冲**不能 free**，所以 llm_run 用 body_heap 标志区分两种来源。
+ */
+EXT_RAM_BSS_ATTR static char s_body_buf[APP_LLM_BODY_BUF_SIZE];
+
+/**
+ * @brief  把请求体序列化成字符串：优先写进 PSRAM 静态缓冲，装不下才退回内部堆
+ *
+ * @param  from_heap 输出：true = 返回值是 malloc 出来的，调用者必须 free
+ * @return JSON 字符串（指向 s_body_buf 或堆）；失败返回 NULL
+ */
+static char *llm_body_to_string(cJSON *root, bool *from_heap)
+{
+    if (cJSON_PrintPreallocated(root, s_body_buf, (int)sizeof(s_body_buf), 0)) {
+        *from_heap = false;
+        return s_body_buf;
+    }
+
+    /* 正常不会走到这里（APP_LLM_BODY_BUF_SIZE 已按最坏情况留足）；
+     * 真超了也只是这一次多用点内部堆，不能因此让整轮对话失败。 */
+    ESP_LOGW(TAG, "请求体超过 %d 字节的 PSRAM 缓冲，退回内部堆（本次会临时占内部 RAM）",
+             (int)sizeof(s_body_buf));
+    *from_heap = true;
+    return cJSON_PrintUnformatted(root);
+}
+
 /**
  * @brief  第 1 轮请求体：system + 历史 + user + tools
  *
- * @param  stream true = stream:true（SSE 流式）
- * @return 堆内存里的 JSON 字符串（调用者 free）；失败返回 NULL
+ * @param  stream    true = stream:true（SSE 流式）
+ * @param  from_heap 输出：true = 返回值需要 free（见 llm_body_to_string）
+ * @return JSON 字符串（静态 PSRAM 或堆）；失败返回 NULL
  */
-static char *llm_build_body(const char *user_text, bool stream)
+static char *llm_build_body(const char *user_text, bool stream, bool *from_heap)
 {
     cJSON *messages = NULL;
     cJSON *root = llm_new_body_root(&messages);
@@ -404,7 +442,7 @@ static char *llm_build_body(const char *user_text, bool stream)
     cJSON_AddBoolToObject(root, "stream", stream ? 1 : 0);
     cJSON_AddNumberToObject(root, "max_tokens", APP_LLM_MAX_TOKENS);
 
-    char *body = cJSON_PrintUnformatted(root);
+    char *body = llm_body_to_string(root, from_heap);
     cJSON_Delete(root);
     return body;
 }
@@ -413,13 +451,15 @@ static char *llm_build_body(const char *user_text, bool stream)
  * @brief  第 2 轮请求体：system + 历史 + user + assistant(tool_calls) + tool(...)
  *
  * @param  st 流式收包上下文（里面的 tools[] 是已经拼好的工具调用）
- * @return 堆内存里的 JSON 字符串（调用者 free）；失败返回 NULL
+ * @param  from_heap 输出：true = 返回值需要 free（见 llm_body_to_string）
+ * @return JSON 字符串（静态 PSRAM 或堆）；失败返回 NULL
  *
  * @note   这里**不再带 tools**：已经搜过一次了，让模型基于结果直接作答，
  *         否则模型可能一轮一轮地搜下去。
  */
 static char *llm_build_followup(const char *user_text, const llm_stream_t *st,
-                                const llm_tool_result_t *results, int count, bool stream)
+                                const llm_tool_result_t *results, int count, bool stream,
+                                bool *from_heap)
 {
     cJSON *messages = NULL;
     cJSON *root = llm_new_body_root(&messages);
@@ -459,7 +499,7 @@ static char *llm_build_followup(const char *user_text, const llm_stream_t *st,
     cJSON_AddBoolToObject(root, "stream", stream ? 1 : 0);
     cJSON_AddNumberToObject(root, "max_tokens", APP_LLM_MAX_TOKENS);
 
-    char *body = cJSON_PrintUnformatted(root);
+    char *body = llm_body_to_string(root, from_heap);
     cJSON_Delete(root);
     return body;
 }
@@ -551,8 +591,11 @@ static esp_err_t llm_request(const char *body, app_http_resp_t *resp, int *statu
         .url            = DEEPSEEK_API_URL,
         .method         = HTTP_METHOD_POST,
         .timeout_ms     = APP_LLM_TIMEOUT_MS,
-        .buffer_size    = 4096,
-        .buffer_size_tx = 2048,
+        /* 收发缓冲都在内部堆里，且从 init 一直活到 cleanup —— 正好和 TLS 峰值重叠。
+         * 4096/2048 对“一次读一块 SSE”是过量的：2KB 足够装下短响应头和一批 SSE 行，
+         * 单行长度另有 APP_HTTP_SSE_LINE_MAX 兜底。省下来的 3KB 直接抬高内部堆低水位。 */
+        .buffer_size    = 2048,
+        .buffer_size_tx = 1024,
         .event_handler  = app_http_event_handler,       /* 逐段回调（流式时按行切分） */
         .user_data      = resp,
 #if APP_TLS_USE_CA_BUNDLE
@@ -684,14 +727,17 @@ static esp_err_t llm_run(const char *user_text, bool stream,
 {
     esp_err_t       err      = ESP_FAIL;
     char           *body     = NULL;
+    bool            body_heap = false;      /* body 是堆上来的吗（静态 PSRAM 缓冲不能 free） */
     char           *resp_buf = NULL;
     app_http_resp_t resp;
     int             status   = 0;
 
     reply[0] = '\0';
 
-    /* 1. 请求体 */
-    body = llm_build_body(user_text, stream);
+    /* 1. 请求体（写进 PSRAM 静态缓冲，不占内部堆） */
+    app_mem_peak_begin();
+    body = llm_build_body(user_text, stream, &body_heap);
+    app_mem_peak_end("建请求体1");      /* 量的是 cJSON 建那棵树的内部堆开销（本应接近 0 了） */
     if (body == NULL) {
         snprintf(reply, reply_size, "内存不足");
         return ESP_ERR_NO_MEM;
@@ -705,7 +751,9 @@ static esp_err_t llm_run(const char *user_text, bool stream,
         resp_buf = (char *)malloc(APP_LLM_RESP_BUF_SIZE);       /* 退化到内部 RAM */
     }
     if (resp_buf == NULL) {
-        free(body);
+        if (body_heap) {
+            free(body);                     /* 静态 PSRAM 缓冲不能 free */
+        }
         snprintf(reply, reply_size, "内存不足");
         return ESP_ERR_NO_MEM;
     }
@@ -722,7 +770,9 @@ static esp_err_t llm_run(const char *user_text, bool stream,
     }
 
     /* ---------- 4. 第 1 轮 ---------- */
+    app_mem_peak_begin();
     err = llm_request(body, &resp, &status);
+    app_mem_peak_end("第1轮请求");      /* 这里的最低值，就是“一条 TLS 连接的内部堆价格” */
     if (err != ESP_OK) {
         snprintf(reply, reply_size, "AI网络连接失败");
         goto done;
@@ -784,27 +834,38 @@ static esp_err_t llm_run(const char *user_text, bool stream,
 
     /* ---------- 6. 有工具调用：执行搜索 + 追问（同样按需流式） ---------- */
     ESP_LOGI(TAG, "模型要求调用 %d 个工具", s_stream.tool_count);
+    app_mem_peak_begin();
     int tool_count = llm_execute_tools(&s_stream);
+    app_mem_peak_end("联网搜索");       /* 搜索也要建 TLS，还要解析 Tavily 那棵 JSON 树 */
     if (tool_count <= 0) {
         snprintf(reply, reply_size, "AI工具调用异常");
         err = ESP_FAIL;
         goto done;
     }
 
-    char *body2 = llm_build_followup(user_text, &s_stream, s_tool_results, tool_count, stream);
+    bool  body2_heap = false;
+    app_mem_peak_begin();
+    char *body2 = llm_build_followup(user_text, &s_stream, s_tool_results, tool_count, stream,
+                                     &body2_heap);
+    app_mem_peak_end("建请求体2");      /* 这一棵最大：5120 字符的搜索结果也要进 JSON */
     if (body2 == NULL) {
         snprintf(reply, reply_size, "内存不足");
         err = ESP_ERR_NO_MEM;
         goto done;
     }
-    free(body);
-    body = body2;
+    if (body_heap) {
+        free(body);
+    }
+    body      = body2;
+    body_heap = body2_heap;
 
     /* 工具参数在 body2 里已经用过了，这里只重置收包状态（保留累积正文与回调） */
     llm_stream_restart(&s_stream);
 
     ESP_LOGI(TAG, "带搜索结果追问：%u 字节（%s）", (unsigned)strlen(body), stream ? "流式" : "整段");
+    app_mem_peak_begin();
     err = llm_request(body, &resp, &status);
+    app_mem_peak_end("追问请求");       /* 本轮最吃内部堆的一段：TLS + 11.8KB 请求体同时在世 */
     if (err != ESP_OK || status != 200) {
         /* 把服务端返回的错误正文解析出来打日志：
          * 400 的原因（参数/UTF-8/上下文超限等）只有这里有，别吞掉 */
@@ -854,8 +915,8 @@ static esp_err_t llm_run(const char *user_text, bool stream,
     err = ESP_OK;
 
 done:
-    if (body != NULL) {
-        free(body);
+    if (body != NULL && body_heap) {
+        free(body);                         /* 静态 PSRAM 缓冲不归调用者释放 */
     }
     if (resp_buf != NULL) {
         free(resp_buf);

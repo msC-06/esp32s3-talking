@@ -111,8 +111,10 @@ void app_net_task(void *arg)
         /* 3. 云端识别（百度 ASR） */
         app_mem_log_brief("识别前");        /* 打点：这一轮的内部堆余量 */
         s_asr_text[0] = '\0';
+        app_mem_peak_begin();
         esp_err_t err = app_asr_recognize((const int16_t *)msg.pcm, msg.bytes,
                                          s_asr_text, sizeof(s_asr_text));
+        app_mem_peak_end("语音识别");       /* ASR 是两条连接（token + 上传），顺带看一眼它的价格 */
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "ASR 失败: %s（%s）", esp_err_to_name(err), s_asr_text);
             app_bus_post_asr(false, s_asr_text);

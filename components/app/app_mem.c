@@ -185,11 +185,57 @@ void app_mem_log(const char *where)
 
 void app_mem_log_brief(const char *where)
 {
-    ESP_LOGI(TAG, "[%s] 内部空闲 %u KB（最大块 %u KB）| PSRAM 空闲 %u KB",
+    /* 带上内部堆的历史最低：打点是“前/后”两笔，中间掉下去的量只有水位能看出来。
+     * 水位是单调的，所以相邻两笔的差值就是这两笔之间那一段吃掉的量 —— 这正是
+     * 定位“到底哪一段把内部 RAM 挤干”最省事的办法。 */
+    ESP_LOGI(TAG, "[%s] 内部空闲 %u KB（最大块 %u KB，历史最低 %u KB）| PSRAM 空闲 %u KB",
              (where != NULL) ? where : "-",
              mem_kb(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
              mem_kb(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+             mem_kb(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
              mem_kb(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+}
+
+/* ============================ 单阶段峰值（可重算的低水位） ============================ */
+
+/**
+ * @brief  峰值监测是否正在跑
+ *
+ * @note   heap_caps_get_minimum_free_size() 给的是“**自开机以来**”的单调水位，只看它永远分不清
+ *         “这轮搜索最凶”和“三个小时前某次更凶”。IDF 5.x 提供的
+ *         heap_caps_monitor_local_minimum_free_size_start/stop 可以把这个水位**重置**到
+ *         调用那一刻，于是 begin/end 一对就量出“这一段自己最低掉到多少”。
+ */
+static bool s_peak_active = false;
+
+void app_mem_peak_begin(void)
+{
+    if (s_peak_active) {
+        return;             /* 已经在量了，不嵌套（嵌套会把起点冲掉，得到的是内层而不是外层） */
+    }
+    s_peak_active = (heap_caps_monitor_local_minimum_free_size_start() == ESP_OK);
+    if (!s_peak_active) {
+        ESP_LOGW(TAG, "局部水位监测启动失败，本段只能看全局水位");
+    }
+}
+
+void app_mem_peak_end(const char *where)
+{
+    /* ⚠️ 顺序：必须在 stop **之前**读最小值 —— stop 之后这个接口又退回“自开机以来”的值，
+     *    先停再读就白测了。 */
+    const size_t int_min  = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    const size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t int_blk  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+
+    if (s_peak_active) {
+        heap_caps_monitor_local_minimum_free_size_stop();
+        s_peak_active = false;
+    }
+
+    /* 一行说完这一段：最低掉到多少（峰值）、现在回来了多少、当时的最大连续块够不够建 TLS */
+    ESP_LOGI(TAG, "[%s] 内部峰值 %u KB（现空闲 %u KB，最大块 %u KB）",
+             (where != NULL) ? where : "-",
+             mem_kb(int_min), mem_kb(int_free), mem_kb(int_blk));
 }
 
 /**

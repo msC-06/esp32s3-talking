@@ -213,7 +213,9 @@ esp_err_t app_web_search(const char *query, char *out_buf, size_t out_size)
         .method         = HTTP_METHOD_POST,
         .timeout_ms     = APP_WEB_SEARCH_TIMEOUT_MS,
         .buffer_size    = 2048,
-        .buffer_size_tx = 2048,
+        /* 发出去的只有两行头 + 一个几百字节的 JSON（响应走事件回调直接进 PSRAM 缓冲），
+         * 收/发缓冲都在内部堆里且活到 cleanup，和 TLS 峰值重叠，能省就省 */
+        .buffer_size_tx = 512,
         .event_handler  = ws_http_event,        /* 响应体靠事件回调拼接 */
         .user_data      = &resp,
 #if APP_TLS_USE_CA_BUNDLE
@@ -241,6 +243,13 @@ esp_err_t app_web_search(const char *query, char *out_buf, size_t out_size)
     esp_err_t err   = esp_http_client_perform(client);
     int       status = esp_http_client_get_status_code(client);
     int       elapsed_ms = (int)((esp_timer_get_time() - t_begin) / 1000);
+
+    /* 响应体已经整段落在 psram_buf 里了，**立刻把连接（含 TLS 会话）拆掉再往下解析**。
+     * TLS 会话（in 16KB + 收发缓冲 + 握手结构）和 cJSON 的整棵语法树都吃内部堆，
+     * 不拆开就是两座山峰叠在一起 —— 这是「搜索那一步内部 RAM 见底」最便宜的一处：
+     * 只是把 cleanup 提前，行为完全不变。 */
+    esp_http_client_cleanup(client);
+    client = NULL;
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "请求失败：%s（耗时 %d ms）", esp_err_to_name(err), elapsed_ms);
@@ -338,7 +347,9 @@ esp_err_t app_web_search(const char *query, char *out_buf, size_t out_size)
     ret = ESP_OK;
 
 cleanup:
-    esp_http_client_cleanup(client);
+    if (client != NULL) {
+        esp_http_client_cleanup(client);    /* 正常路径已经在 perform 之后提前拆掉了 */
+    }
     free(body);
     heap_caps_free(psram_buf);      /* 响应缓冲每次都释放，不留驻内存 */
     if (ret != ESP_OK) {

@@ -122,6 +122,21 @@
 /** 读 HTTP 响应用的缓冲（PSRAM 分配）：回复正文 + tool_calls + usage 都给足 */
 #define APP_LLM_RESP_BUF_SIZE   (32 * 1024)
 
+/**
+ * 请求体（JSON 字符串）缓冲大小，**放 PSRAM 静态区**（见 app_llm.c 的 s_body_buf）。
+ *
+ * 为什么不能放内部堆：请求体从「组好」到「HTTP 客户端清理」一直有效，
+ * 而这整段时间正是 TLS 握手/收发吃内部堆的时候（in 16KB + out 4KB + 客户端收发缓冲）。
+ * 两者叠加才是「搜索后追问」那一步内部堆见底的主因。
+ *
+ * 容量账（最坏情况，第 2 轮带工具结果的请求）：
+ *   system 512 + 历史 4096 + user 2048 + assistant/tool_calls ~300
+ *   + 工具结果 5120 + 外壳/model/stream ~100   ≈ 12.2KB
+ *   JSON 转义会膨胀（\n → 2 字节），按 1.3 倍算 ≈ 16KB，留到 20KB。
+ * 万一真超了，代码会退回 cJSON_PrintUnformatted（内部堆），只影响那一次，不会出错。
+ */
+#define APP_LLM_BODY_BUF_SIZE   (20 * 1024)
+
 /** web_search 工具的描述：决定模型什么时候去联网搜索 */
 #define APP_LLM_TOOL_DESC       \
     "联网搜索工具。遇到实时信息（新闻、天气、价格、比分、人物近况）或你不确定的知识时调用它，" \
